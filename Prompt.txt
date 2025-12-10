@@ -1,0 +1,468 @@
+✅ FULL PROJECT SPECIFICATION (NO CODE)
+IVR Call Log Analyzer – Full-Stack AI System (Audio + Text, NER + Intent + Sentiment + Analytics)
+
+Backend: FastAPI (Python) · Frontend: React/Next.js · Whisper Large-v3 · spaCy · BERT · Rule-based AI · RL Adaptation
+
+📌 PROJECT OBJECTIVE
+
+Build a complete, production-grade web application that performs:
+
+Named Entity Recognition (NER) on IVR call logs
+
+Supports BOTH:
+
+Audio input → Whisper Large-v3 → transcript → NER
+
+Text input → NER
+
+System outputs:
+
+Extracted entities (PERSON, ORG, MONEY, DATE, ACCOUNT_ID, ISSUE_TYPE, etc.)
+
+Simple rule-based relationships
+
+Intent detection
+
+Multilingual sentiment + emotion analysis
+
+Auto call summaries
+
+Threat & profanity detection
+
+Compliance scoring
+
+Real-time agent assist
+
+Call analytics dashboard
+
+Reinforcement Learning–based adaptive call flows
+
+🧠 KEY FEATURES REQUIRED
+1️⃣ Multi-language Auto Detection
+
+Detect whether call is in English or Hindi.
+
+2️⃣ Emotion & Sentiment Analysis
+
+Lexicon + rule-based hybrid (English + Hindi).
+
+3️⃣ AI-based Intent Detection
+
+Payment issues, login issues, balance inquiry, card lost, general complaint, etc.
+
+4️⃣ Entity Extraction (Hybrid NER)
+
+spaCy NER
+
+BERT NER
+
+Rule-based NER (ACCOUNT_ID, ISSUE_TYPE, etc.)
+
+Merge entities from all sources
+
+Support for both English + Hindi
+
+5️⃣ Auto Call Summary Generation
+
+Short summary using:
+
+Detected entities
+
+Intent
+
+Sentiment
+
+Issue types
+
+Key sentences
+
+6️⃣ Real-time Agent Assist
+
+Provide:
+
+Suggested next best actions
+
+Compliance gaps
+
+De-escalation suggestions
+
+RL-based adaptive flow choices
+
+7️⃣ Call Compliance Checker
+
+Detects:
+
+Greeting
+
+Identity verification
+
+Mandatory disclosure
+
+Proper closing
+
+Scores call 0–100.
+
+8️⃣ Threat & Profanity Detection
+
+Detects:
+
+Abuse words
+
+Legal threats
+
+Court/police warnings
+
+9️⃣ Analytics Dashboard
+
+Aggregates:
+
+Total calls
+
+Intent distribution
+
+Entity frequency
+
+Sentiment timeline
+
+Threat/profanity counts
+
+Most common issues
+
+Language distribution
+
+🔟 Reinforcement Learning Adaptive Call Flow
+
+Epsilon-greedy RL policy:
+
+Learns best responses for each intent
+
+Updates via feedback endpoint
+
+Improves agent-actions over time
+
+🏗️ TECH STACK
+Backend: FastAPI (Python)
+
+Whisper Large-v3 (OpenAI API)
+
+spaCy (en_core_web_sm)
+
+HuggingFace BERT (dslim/bert-base-NER)
+
+Pydantic
+
+SQLAlchemy (+ SQLite)
+
+Transformers pipeline
+
+Langdetect
+
+Spellchecker
+
+CORS support (React frontend)
+
+Frontend: React or Next.js
+
+File upload
+
+Text input
+
+Entity highlighting
+
+Relationship visualization
+
+Analytics UI
+
+TailwindCSS / Chakra UI / Material UI
+
+Database
+
+SQLite (simple & portable)
+
+Table stores:
+
+transcript
+
+entities
+
+relationships
+
+timestamp
+
+sentiment
+
+intent
+
+call score
+
+🌐 BACKEND API REQUIREMENTS
+1️⃣ POST /api/transcribe-audio
+
+Input:
+
+audio file (.wav, .mp3, .m4a, .ogg, .flac)
+
+Process:
+
+Validate format + size
+
+Send to Whisper Large-v3
+
+Receive transcript + language
+
+Output JSON:
+
+transcript
+
+language
+
+duration
+
+2️⃣ POST /api/analyze-text
+
+Input:
+
+{ "text": "..." }
+
+
+Pipeline:
+
+spaCy NER
+
+BERT NER
+
+Rule-based NER
+
+Entity merge
+
+Relationship extraction
+
+Intent detection
+
+Sentiment/emotion
+
+Compliance
+
+Agent assist
+
+Call scoring
+
+Output JSON:
+
+text
+
+language
+
+entities []
+
+relationships []
+
+sentiment
+
+intents
+
+summary
+
+compliance
+
+risk flags
+
+agent assist suggestions
+
+call_score
+
+3️⃣ POST /api/analyze-audio
+
+Input:
+
+Audio file
+
+Flow:
+
+Call /api/transcribe-audio internally
+
+Run same NER pipeline as text
+
+Return transcript + analysis
+
+4️⃣ GET /api/history
+
+Return all past call analyses:
+
+entities
+
+transcripts
+
+relationships
+
+timestamps
+
+5️⃣ GET /api/analytics-dashboard
+
+Aggregates:
+
+sentiment
+
+intent
+
+issue types
+
+threat
+
+profanity
+
+count by language
+
+count by call type
+
+6️⃣ POST /api/flow-feedback
+
+Input:
+
+call_id
+
+intent
+
+chosen_action
+
+reward
+
+Used to update RL policy.
+
+🎨 FRONTEND REQUIREMENTS (React/Next.js)
+UI Components:
+1. Audio Upload Panel
+
+Upload button
+
+Loader + progress
+
+Show transcript
+
+2. Text Input Panel
+
+Large textarea
+
+Submit button
+
+Show analysis results
+
+3. Entity Highlighter
+
+Highlight text by entity type
+
+Color coding legend
+
+Hover for details
+
+4. Entities Table
+
+Columns: text, label, start, end, source
+
+5. Relationships Viewer
+
+Simple cards, e.g.:
+
+Customer —reports→ payment failure
+Customer —has_account→ 9876543210
+
+6. Analytics Dashboard
+
+Show:
+
+Pie charts
+
+Bar graphs
+
+Quick stats
+
+🔐 ENVIRONMENT VARIABLES
+
+Backend should require:
+
+OPENAI_API_KEY=<your-key>
+DATABASE_URL=sqlite:///ivr.db
+ALLOWED_ORIGINS=http://localhost:3000
+
+
+Include .env.example.
+
+🧱 FOLDER STRUCTURE
+project/
+│── backend/
+│   │── main.py
+│   │── models/
+│   │── services/
+│   │── utils/
+│   │── requirements.txt
+│   │── .env.example
+│
+│── frontend/
+│   │── package.json
+│   │── src/
+│   │── components/
+│   │── pages/
+│   │── styles/
+│
+│── README.md
+
+🔄 PIPELINE DIAGRAM
+Audio Path
+Audio File → Backend → Whisper Large-v3 → Transcript → NER (spaCy + BERT + Rule-based)
+→ Intent + Sentiment + Risk + compliance
+→ Relationships
+→ Summary
+→ UI Visualization
+
+Text Path
+Text → NER → Intent → Sentiment → Relationships → Summary → UI
+
+📖 README MUST INCLUDE
+1. Overview
+2. Tech stack
+3. Backend setup
+
+Create venv
+
+Install requirements
+
+Download spaCy model
+
+Add API key
+
+Run FastAPI
+
+4. Frontend setup
+
+Install dependencies
+
+Run dev server
+
+5. Usage steps
+
+Upload audio
+
+Paste text
+
+View entities
+
+View relationships
+
+6. Environment variables
+7. Known limitations
+8. Future improvements
+📦 DELIVERABLES REQUIRED
+
+Full Backend (FastAPI)
+
+Full Frontend (React/Next.js)
+
+requirements.txt
+
+package.json
+
+.env.example
+
+README.md with full instructions
+
+Optional screenshot descriptions 
