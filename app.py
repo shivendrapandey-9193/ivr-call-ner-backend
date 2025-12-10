@@ -228,13 +228,14 @@ class FlowFeedbackRequest(BaseModel):
 # NER MODELS – SpaCy + BERT
 ###############################################################
 
+# ✅ Auto-download en_core_web_sm if missing
 try:
     nlp_spacy = spacy.load("en_core_web_sm")
-except OSError as e:
-    raise RuntimeError(
-        "SpaCy model 'en_core_web_sm' is not installed. "
-        "Run: python -m spacy download en_core_web_sm"
-    ) from e
+except OSError:
+    from spacy.cli import download
+    print("⚠ SpaCy model 'en_core_web_sm' not found. Downloading...")
+    download("en_core_web_sm")
+    nlp_spacy = spacy.load("en_core_web_sm")
 
 BERT_MODEL_NAME = "dslim/bert-base-NER"
 
