@@ -34,10 +34,12 @@ warnings.filterwarnings(
 set_verbosity_error()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("pydantic").setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -45,12 +47,18 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 import spacy
 from spacy.util import minibatch, compounding
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+
+# transformers import guarded (BERT optional)
+try:
+    from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
+
 from groq import Groq
 from dotenv import load_dotenv
 from spellchecker import SpellChecker
 from langdetect import detect, LangDetectException
-
 
 ###############################################################
 # ENVIRONMENT + GROQ KEY
@@ -75,7 +83,7 @@ def get_groq_client() -> Groq:
 
 
 if not GROQ_API_KEY:
-    print("⚠ WARNING: GROQ_API_KEY not set. Whisper STT endpoints will fail.")
+    logger.warning("⚠ WARNING: GROQ_API_KEY not set. Whisper STT endpoints will fail.")
 
 
 ###############################################################
@@ -228,30 +236,41 @@ class FlowFeedbackRequest(BaseModel):
 # NER MODELS – SpaCy + BERT
 ###############################################################
 
-# ✅ Auto-download en_core_web_sm if missing
+# ✅ DO NOT auto-download en_core_web_sm at runtime.
+#    Install the model via requirements (wheel URL) instead.
 try:
     nlp_spacy = spacy.load("en_core_web_sm")
-except OSError:
-    from spacy.cli import download
-    print("⚠ SpaCy model 'en_core_web_sm' not found. Downloading...")
-    download("en_core_web_sm")
-    nlp_spacy = spacy.load("en_core_web_sm")
+    logger.info("Loaded SpaCy model en_core_web_sm")
+except Exception as e:
+    logger.error(
+        "SpaCy model 'en_core_web_sm' could not be loaded. "
+        "Make sure you installed the model via requirements (pre-download the wheel). Error: %s",
+        e,
+    )
+    raise
 
 BERT_MODEL_NAME = "dslim/bert-base-NER"
+nlp_bert = None
+BERT_AVAILABLE = False
 
-try:
-    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
-    bert_model = AutoModelForTokenClassification.from_pretrained(BERT_MODEL_NAME)
-    nlp_bert = pipeline(
-        "ner",
-        model=bert_model,
-        tokenizer=tokenizer,
-        aggregation_strategy="simple",
-    )
-    BERT_AVAILABLE = True
-except Exception:
-    nlp_bert = None
-    BERT_AVAILABLE = False
+if TRANSFORMERS_AVAILABLE:
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+        bert_model = AutoModelForTokenClassification.from_pretrained(BERT_MODEL_NAME)
+        nlp_bert = pipeline(
+            "ner",
+            model=bert_model,
+            tokenizer=tokenizer,
+            aggregation_strategy="simple",
+        )
+        BERT_AVAILABLE = True
+        logger.info("BERT NER pipeline initialized.")
+    except Exception as e:
+        nlp_bert = None
+        BERT_AVAILABLE = False
+        logger.warning("BERT pipeline unavailable; falling back to spaCy only. Error: %s", e)
+else:
+    logger.info("Transformers not available; spaCy-only NER will be used.")
 
 
 ###############################################################
@@ -571,7 +590,7 @@ def run_bert_ner(text: str) -> List[Dict]:
     try:
         results = nlp_bert(text)
     except Exception as e:
-        print(f"⚠ BERT NER failed at runtime, falling back to spaCy only: {e}")
+        logger.warning("⚠ BERT NER failed at runtime, falling back to spaCy only: %s", e)
         return []
 
     ents: List[Dict] = []
@@ -720,7 +739,7 @@ def analyze_text_ner(text: str) -> List[Dict]:
     try:
         spacy_ents = run_spacy_ner(text)
     except Exception as e:
-        print(f"❌ SpaCy NER failed: {e}")
+        logger.warning("❌ SpaCy NER failed: %s", e)
         spacy_ents = []
 
     bert_ents = run_bert_ner(text)
@@ -1694,7 +1713,8 @@ async def api_flow_feedback(req: FlowFeedbackRequest):
 ###############################################################
 
 @app.get("/")
-def root():
+@app.head("/")
+def root(request: Request = None):
     return {"status": "ok", "message": "IVR AI Backend running 🚀"}
 
 
@@ -1705,4 +1725,5 @@ def root():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
