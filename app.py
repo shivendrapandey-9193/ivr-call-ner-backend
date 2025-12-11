@@ -1,43 +1,25 @@
-###############################################################
-#  IVR NER ANALYZER – BACKEND (EN + HINDI + SCORING, IMPROVED+)
-#  FastAPI + Groq Whisper Large-v3 + SpaCy + Rule-based AI
-#  + Feature Engineering + SQLite + Analytics + RL Flows + Scoring
-###############################################################
+# app.py
+"""
+IVR NER Analyzer - Improved single-file FastAPI backend
+Features:
+ - FastAPI endpoints for text/audio analysis
+ - SpaCy NER (en_core_web_sm)
+ - Optional BERT NER (transformers) if ENABLE_BERT=1
+ - Groq Whisper transcription (requires GROQ_API_KEY)
+ - Rule-based enhancements (ACCOUNT_ID, ISSUE_TYPE)
+ - Hindi-aware postprocessing
+ - SQLite persistence via SQLAlchemy
+"""
 
 import os
+import re
 import json
 import tempfile
-import re
 import random
+import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Union
 from collections import defaultdict, Counter
-
-# ------------------------------------------------------------
-# WARNING / LOG SUPPRESSION (clean console)
-# ------------------------------------------------------------
-import warnings
-import logging
-from transformers.utils.logging import set_verbosity_error
-
-warnings.filterwarnings(
-    "ignore",
-    message="Valid config keys have changed in V2:",
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    "ignore",
-    message="Valid config keys have changed",
-    category=UserWarning,
-)
-
-set_verbosity_error()
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("pydantic").setLevel(logging.ERROR)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,68 +27,65 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-import spacy
-from spacy.util import minibatch, compounding
-
-# transformers import guarded (BERT optional)
+# Optional / third-party imports that should be in requirements.txt
 try:
-    from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-    TRANSFORMERS_AVAILABLE = True
+    import spacy
+except Exception as e:
+    spacy = None
+
+try:
+    from spellchecker import SpellChecker
 except Exception:
-    TRANSFORMERS_AVAILABLE = False
+    SpellChecker = None
 
-from groq import Groq
+try:
+    from langdetect import detect, LangDetectException
+except Exception:
+    detect = None
+    LangDetectException = Exception
+
+# transformers are optional; load if env says so
+ENABLE_BERT = os.getenv("ENABLE_BERT", "0") in {"1", "true", "True"}
+TRANSFORMERS_AVAILABLE = False
+if ENABLE_BERT:
+    try:
+        from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+        TRANSFORMERS_AVAILABLE = True
+    except Exception:
+        TRANSFORMERS_AVAILABLE = False
+
+# Groq client optional
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("ivr-ner")
+
+# Load environment
 from dotenv import load_dotenv
-from spellchecker import SpellChecker
-from langdetect import detect, LangDetectException
-
-###############################################################
-# ENVIRONMENT + GROQ KEY
-###############################################################
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-_groq_client: Optional[Groq] = None
-
-
-def get_groq_client() -> Groq:
-    """
-    Lazily create and cache the Groq client.
-    """
-    global _groq_client
-    if _groq_client is None:
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY not set. Cannot initialize Groq client.")
-        _groq_client = Groq(api_key=GROQ_API_KEY)
-    return _groq_client
-
-
-if not GROQ_API_KEY:
-    logger.warning("⚠ WARNING: GROQ_API_KEY not set. Whisper STT endpoints will fail.")
-
-
-###############################################################
-# DATABASE (SQLite via SQLAlchemy)
-###############################################################
-
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ivr_ner.db")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 
+# SQLAlchemy setup
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
 )
-
 Base = declarative_base()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 class CallAnalysis(Base):
     __tablename__ = "call_analysis"
-
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    input_type = Column(String(20))  # "audio" or "text"
+    input_type = Column(String(20))  # audio | text
     transcript = Column(Text)
     entities_json = Column(Text)
     relationships_json = Column(Text)
@@ -123,10 +102,7 @@ def get_db():
         db.close()
 
 
-###############################################################
-# Pydantic Schemas
-###############################################################
-
+# Pydantic schemas
 class Entity(BaseModel):
     text: str
     label: str
@@ -212,494 +188,304 @@ class AnalyzeAudioResponse(BaseModel):
     call_score: int
 
 
-class HistoryItem(BaseModel):
-    id: int
-    created_at: datetime
-    input_type: str
-    transcript: str
-    entities: List[Entity]
-    relationships: List[Relationship]
-
-    class Config:
-        orm_mode = True
-        from_attributes = True
-
-
-class FlowFeedbackRequest(BaseModel):
-    call_id: Optional[int] = None
-    intent: Optional[str] = None
-    chosen_action: str
-    reward: float
-
-
-###############################################################
-# NER MODELS – SpaCy + BERT
-###############################################################
-
-# ✅ DO NOT auto-download en_core_web_sm at runtime.
-#    Install the model via requirements (wheel URL) instead.
-try:
-    nlp_spacy = spacy.load("en_core_web_sm")
-    logger.info("Loaded SpaCy model en_core_web_sm")
-except Exception as e:
-    logger.error(
-        "SpaCy model 'en_core_web_sm' could not be loaded. "
-        "Make sure you installed the model via requirements (pre-download the wheel). Error: %s",
-        e,
-    )
-    raise
-
-BERT_MODEL_NAME = "dslim/bert-base-NER"
+# -------------------------
+# Models: SpaCy + optional BERT
+# -------------------------
+nlp_spacy = None
 nlp_bert = None
-BERT_AVAILABLE = False
 
-if TRANSFORMERS_AVAILABLE:
+def try_load_spacy():
+    global nlp_spacy
+    if nlp_spacy is not None:
+        return
+    if spacy is None:
+        logger.error("spaCy is not installed. Please install spacy and the language wheel (en_core_web_sm).")
+        return
     try:
+        # do NOT auto-download inside runtime on hosted platforms; expect model installed in build.
+        nlp_spacy = spacy.load("en_core_web_sm")
+        logger.info("Loaded spaCy model: en_core_web_sm")
+    except Exception as e:
+        logger.error("Could not load spaCy model 'en_core_web_sm'. Install the model before starting. Error: %s", e)
+        nlp_spacy = None
+
+
+def try_load_bert():
+    global nlp_bert
+    if not TRANSFORMERS_AVAILABLE:
+        logger.info("Transformers not enabled or not available. BERT disabled.")
+        return
+    try:
+        BERT_MODEL_NAME = os.getenv("BERT_MODEL_NAME", "dslim/bert-base-NER")
         tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
         bert_model = AutoModelForTokenClassification.from_pretrained(BERT_MODEL_NAME)
-        nlp_bert = pipeline(
-            "ner",
-            model=bert_model,
-            tokenizer=tokenizer,
-            aggregation_strategy="simple",
-        )
-        BERT_AVAILABLE = True
-        logger.info("BERT NER pipeline initialized.")
+        nlp_bert = pipeline("ner", model=bert_model, tokenizer=tokenizer, aggregation_strategy="simple")
+        logger.info("Loaded BERT NER pipeline: %s", BERT_MODEL_NAME)
     except Exception as e:
+        logger.warning("Failed to init BERT pipeline: %s", e)
         nlp_bert = None
-        BERT_AVAILABLE = False
-        logger.warning("BERT pipeline unavailable; falling back to spaCy only. Error: %s", e)
-else:
-    logger.info("Transformers not available; spaCy-only NER will be used.")
 
 
-###############################################################
-# FEATURE ENGINEERING – ADVANCED TEXT CLEANING
-###############################################################
+# call loads at startup
+try_load_spacy()
+if ENABLE_BERT:
+    try_load_bert()
 
-spell = SpellChecker()
+# -------------------------
+# Groq client (lazy)
+# -------------------------
+_groq_client = None
 
-FILLER_WORDS = {
-    "uh", "umm", "hmm", "like", "basically", "actually", "you know",
-    "i mean", "so yeah", "okay so", "well", "right", "listen",
-}
+def get_groq_client():
+    global _groq_client
+    if _groq_client is not None:
+        return _groq_client
+    if Groq is None:
+        raise RuntimeError("groq python SDK not installed.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured.")
+    _groq_client = Groq(api_key=GROQ_API_KEY)
+    return _groq_client
 
-IVR_BOILERPLATE = [
-    "this call may be recorded for quality purposes",
-    "press 1 to continue",
-    "press 2",
-    "press 3",
-    "please wait while we connect your call",
-    "your call is important to us",
-    "welcome to the interactive voice response system",
-    "welcome to our customer care",
-    "welcome to customer support",
-]
-
-
-###############################################################
-# SPOKEN NUMBER → DIGIT CONVERSION (EN + HINDI)
-###############################################################
-
+# -------------------------
+# Text cleaning + numbers
+# -------------------------
+# small Hindi/English number maps (extend as needed)
 NUMBER_WORDS_EN = {
-    "zero": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
+    "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
+    "six":"6","seven":"7","eight":"8","nine":"9"
 }
-
 NUMBER_WORDS_HI = {
-    "एक": "1",
-    "दो": "2",
-    "तीन": "3",
-    "चार": "4",
-    "पांच": "5",
-    "पाँच": "5",
-    "छः": "6",
-    "छह": "6",
-    "सात": "7",
-    "आठ": "8",
-    "नौ": "9",
-    "शून्य": "0",
+    "एक":"1","दो":"2","तीन":"3","चार":"4","पांच":"5","पाँच":"5","छह":"6","छः":"6",
+    "सात":"7","आठ":"8","नौ":"9","शून्य":"0"
 }
-
 
 def _normalize_word_token(token: Optional[str]) -> str:
-    """
-    Lowercase and strip punctuation, keep Devanagari for Hindi.
-    """
     if token is None:
         return ""
     return re.sub(r"[^\w\u0900-\u097F]", "", token.lower())
 
-
 def spoken_numbers_to_digits(text: str) -> str:
-    """
-    Convert spoken digit sequences in EN / HI to numeric strings.
-    """
     if not text:
         return ""
-
     words = text.split()
-    output: List[str] = []
+    result = []
     i = 0
-
     while i < len(words):
-        raw = words[i]
-        w = _normalize_word_token(raw)
-
+        w_raw = words[i]
+        w = _normalize_word_token(w_raw)
         if w in NUMBER_WORDS_EN:
-            digit_str = NUMBER_WORDS_EN[w]
+            digits = NUMBER_WORDS_EN[w]
             i += 1
             while i < len(words) and _normalize_word_token(words[i]) in NUMBER_WORDS_EN:
-                digit_str += NUMBER_WORDS_EN[_normalize_word_token(words[i])]
+                digits += NUMBER_WORDS_EN[_normalize_word_token(words[i])]
                 i += 1
-            output.append(digit_str)
+            result.append(digits)
             continue
-
         if w in NUMBER_WORDS_HI:
-            digit_str = NUMBER_WORDS_HI[w]
+            digits = NUMBER_WORDS_HI[w]
             i += 1
             while i < len(words) and _normalize_word_token(words[i]) in NUMBER_WORDS_HI:
-                digit_str += NUMBER_WORDS_HI[_normalize_word_token(words[i])]
+                digits += NUMBER_WORDS_HI[_normalize_word_token(words[i])]
                 i += 1
-            output.append(digit_str)
+            result.append(digits)
             continue
-
-        output.append(raw)
+        result.append(w_raw)
         i += 1
+    merged = " ".join(result)
 
-    merged = " ".join(output)
-
-    # EN digit + EN word
-    pattern_en = re.compile(
-        r"\b(?P<num>\d{5,})\s+(?P<word>zero|one|two|three|four|five|six|seven|eight|nine)\b",
-        re.IGNORECASE,
-    )
-
-    def _merge_match_en(m: re.Match) -> str:
-        num = m.group("num")
-        word = m.group("word").lower()
-        return num + NUMBER_WORDS_EN[word]
-
-    while True:
-        new_merged, count = pattern_en.subn(_merge_match_en, merged)
-        if count == 0:
-            break
-        merged = new_merged
-
-    # EN digit + HI word
-    pattern_hi = re.compile(
-        r"\b(?P<num>\d{5,})\s+(?P<word>एक|दो|तीन|चार|पांच|पाँच|छः|छह|सात|आठ|नौ|शून्य)\b",
-        re.IGNORECASE,
-    )
-
-    def _merge_match_hi(m: re.Match) -> str:
-        num = m.group("num")
-        word = m.group("word")
-        return num + NUMBER_WORDS_HI.get(word, "")
-
-    while True:
-        new_merged, count = pattern_hi.subn(_merge_match_hi, merged)
-        if count == 0:
-            break
-        merged = new_merged
-
+    # Merge patterns like "12345 five" -> "123455"
+    merged = re.sub(r"\b(\d{5,})\s+(zero|one|two|three|four|five|six|seven|eight|nine)\b",
+                    lambda m: m.group(1) + NUMBER_WORDS_EN[m.group(2)], merged, flags=re.I)
     return merged
 
+# Spell checker optional
+spell = None
+if SpellChecker is not None:
+    try:
+        spell = SpellChecker()
+    except Exception:
+        spell = None
+
+FILLER_WORDS = {"uh","umm","hmm","like","basically","actually","you know","i mean","so yeah","okay so","well","right","listen"}
+IVR_BOILERPLATE = [
+    "this call may be recorded for quality purposes",
+    "press 1 to continue",
+    "please wait while we connect your call",
+    "your call is important to us",
+    "welcome to the interactive voice response system",
+    "welcome to customer support",
+]
 
 def feature_engineer_text(text: str) -> str:
-    """
-    Advanced text cleanup, noise removal, normalization & feature engineering.
-    """
     if not text:
         return ""
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
+    text = text.replace("\r\n"," ").replace("\n"," ")
+    text = re.sub(r"\s+"," ", text).strip()
     temp = text.lower()
-
     for phrase in IVR_BOILERPLATE:
         temp = temp.replace(phrase, " ")
-
     for fw in FILLER_WORDS:
         temp = re.sub(rf"\b{re.escape(fw)}\b", " ", temp)
-
-    temp = re.sub(r"\s+", " ", temp).strip()
-    temp = re.sub(r"[!?.,]{2,}", ".", temp)
-    temp = temp.replace("..", ".")
     temp = re.sub(r"\s+([.,!?])", r"\1", temp)
-
     temp = spoken_numbers_to_digits(temp)
-
-    corrected_words: List[str] = []
-    for word in temp.split():
-        if re.fullmatch(r"\d{3,12}", word):
-            corrected_words.append(word)
+    tokens = []
+    for tok in temp.split():
+        # keep short tokens, numbers, currency or Devanagari tokens untouched
+        if re.fullmatch(r"\d{1,12}", tok) or re.search(r"[₹$€£]|,\d{3}", tok) or len(tok) < 3 or re.search(r"[\u0900-\u097F]", tok):
+            tokens.append(tok)
             continue
-        if re.search(r"[₹$€£]|,\d{3}", word):
-            corrected_words.append(word)
-            continue
-        if len(word) < 3:
-            corrected_words.append(word)
-            continue
-        # keep Hindi tokens untouched
-        if re.search(r"[\u0900-\u097F]", word):
-            corrected_words.append(word)
-            continue
-
-        try:
-            corrected = spell.correction(word)
-            if corrected is None:
-                corrected = word
-        except Exception:
-            corrected = word
-
-        corrected_words.append(corrected)
-
-    cleaned = " ".join(corrected_words)
-
-    sentences = [s.strip() for s in re.split(r"[.]", cleaned) if s.strip()]
-    capped_sentences: List[str] = []
-    for s in sentences:
-        if not s:
-            continue
-        if re.search(r"[A-Za-z]", s):
-            capped_sentences.append(s[0].upper() + s[1:])
+        if spell:
+            try:
+                corrected = spell.correction(tok) or tok
+            except Exception:
+                corrected = tok
+            tokens.append(corrected)
         else:
-            capped_sentences.append(s)
+            tokens.append(tok)
+    cleaned = " ".join(tokens)
+    # sentence casing for english spans
+    sentences = [s.strip() for s in re.split(r"[.!?]", cleaned) if s.strip()]
+    out_sents = []
+    for s in sentences:
+        if re.search(r"[A-Za-z]", s):
+            out_sents.append(s[0].upper() + s[1:])
+        else:
+            out_sents.append(s)
+    return ". ".join(out_sents).strip()
 
-    cleaned = ". ".join(capped_sentences)
-    return cleaned.strip()
-
-
-###############################################################
-# AUDIO VALIDATION
-###############################################################
-
-ALLOWED_AUDIO_EXT = {
-    ".wav", ".mp3", ".m4a", ".flac", ".ogg",
-    ".mp4", ".webm", ".mpeg", ".mpga",
-}
-MAX_AUDIO_MB = 25
-
-
-def validate_audio(filename: str, size: int):
-    ext = os.path.splitext(filename or "")[1].lower()
-    if ext not in ALLOWED_AUDIO_EXT:
-        raise ValueError(
-            f"Unsupported audio format: {ext}. "
-            f"Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXT))}"
-        )
-
-    if size > MAX_AUDIO_MB * 1024 * 1024:
-        raise ValueError(f"File too large (> {MAX_AUDIO_MB} MB).")
-
-
-###############################################################
-# GROQ WHISPER LARGE-v3 TRANSCRIPTION
-###############################################################
-
-def transcribe_audio(file_bytes: bytes, filename: str) -> Dict[str, Optional[Union[str, float]]]:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not configured on server.")
-
-    client = get_groq_client()
-
-    suffix = os.path.splitext(filename)[1] or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-
-        with open(tmp.name, "rb") as audio:
-            response = client.audio.transcriptions.create(
-                model="whisper-large-v3",
-                file=audio,
-                response_format="verbose_json",
-            )
-
-    if isinstance(response, dict):
-        text = response.get("text", "") or ""
-        language = response.get("language")
-        duration = response.get("duration")
-    else:
-        text = getattr(response, "text", "") or ""
-        language = getattr(response, "language", None)
-        duration = getattr(response, "duration", None)
-
-    return {
-        "transcript": text,
-        "language": language,
-        "duration": duration,
-    }
-
-
-###############################################################
-# HELPER: HINDI TEXT DETECTION
-###############################################################
-
-def is_hindi_text(text: str) -> bool:
-    """
-    True if text contains Devanagari characters.
-    """
-    return bool(re.search(r"[\u0900-\u097F]", text))
-
-
-###############################################################
-# NER PIPELINE (SpaCy + BERT + Rule-based)
-###############################################################
-
+# -------------------------
+# NER pipeline helpers
+# -------------------------
 def run_spacy_ner(text: str) -> List[Dict]:
+    if nlp_spacy is None:
+        return []
     doc = nlp_spacy(text)
-    ents: List[Dict] = []
+    ents = []
     for ent in doc.ents:
-        ents.append(
-            {
-                "text": ent.text,
-                "label": ent.label_,
-                "start": ent.start_char,
-                "end": ent.end_char,
-                "source": "spacy",
-            }
-        )
+        ents.append({
+            "text": ent.text,
+            "label": ent.label_,
+            "start": ent.start_char,
+            "end": ent.end_char,
+            "source": "spacy"
+        })
     return ents
 
-
 def _normalize_bert_label(label: str) -> str:
-    mapping = {
-        "PER": "PERSON",
-        "ORG": "ORG",
-        "LOC": "LOC",
-        "MISC": "MISC",
-    }
+    mapping = {"PER":"PERSON","ORG":"ORG","LOC":"LOC","MISC":"MISC"}
     return mapping.get(label, label)
 
-
 def run_bert_ner(text: str) -> List[Dict]:
-    if not BERT_AVAILABLE or nlp_bert is None:
+    if not TRANSFORMERS_AVAILABLE or nlp_bert is None:
         return []
-
     try:
         results = nlp_bert(text)
     except Exception as e:
-        logger.warning("⚠ BERT NER failed at runtime, falling back to spaCy only: %s", e)
+        logger.warning("BERT NER failed: %s", e)
         return []
-
-    ents: List[Dict] = []
+    ents = []
     for r in results:
-        ents.append(
-            {
-                "text": r.get("word", ""),
-                "label": _normalize_bert_label(r.get("entity_group", "")),
-                "start": int(r.get("start", 0)),
-                "end": int(r.get("end", 0)),
-                "source": "bert",
-            }
-        )
+        ents.append({
+            "text": r.get("word",""),
+            "label": _normalize_bert_label(r.get("entity_group","")),
+            "start": int(r.get("start",0)),
+            "end": int(r.get("end",0)),
+            "source": "bert"
+        })
     return ents
 
-
 def merge_entities(spacy_entities: List[Dict], bert_entities: List[Dict]) -> List[Dict]:
-    merged: Dict[tuple, Dict] = {}
-
-    for e in spacy_entities:
-        key = (e["start"], e["end"], e["label"])
-        merged[key] = e.copy()
-
-    for e in bert_entities:
-        key = (e["start"], e["end"], e["label"])
+    merged = {}
+    # use (start,end,label) as key but prefer longer spans
+    for e in spacy_entities + bert_entities:
+        key = (e.get("start",0), e.get("end",0), e.get("label",""))
         if key in merged:
-            merged[key]["source"] = "merged"
+            # keep the longest text span (defensive)
+            existing = merged[key]
+            if len(e.get("text","")) > len(existing.get("text","")):
+                merged[key] = e
+            else:
+                # merge sources
+                existing["source"] = "merged"
         else:
             merged[key] = e.copy()
-
     return list(merged.values())
 
-
+# rule-based entity upgrades
 def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
-    """
-    Add/adjust rule-based entities like ACCOUNT_ID and ISSUE_TYPE.
-    - For 8–12 digit numbers, override CARDINAL → ACCOUNT_ID.
-    """
-    new_entities = [e.copy() for e in entities]
-
-    # 1) Upgrade numeric IDs to ACCOUNT_ID
-    for e in new_entities:
+    new = [e.copy() for e in entities]
+    # upgrade 8-12 digit numbers to ACCOUNT_ID
+    for e in new:
         if e.get("label") in {"CARDINAL", "DATE"}:
-            if re.fullmatch(r"\d{8,12}", e.get("text", "").strip()):
+            if re.fullmatch(r"\d{8,12}", e.get("text","").strip()):
                 e["label"] = "ACCOUNT_ID"
                 e["source"] = "rule"
-
-    # 2) Ensure any 8-12 digit sequence in text is captured as ACCOUNT_ID
+    # find any 8-12 digit in text
     for m in re.finditer(r"\b\d{8,12}\b", text):
-        start, end = m.start(), m.end()
-        span_text = m.group(0)
-        span_found = False
-        for e in new_entities:
-            if e["start"] == start and e["end"] == end:
-                # Already there – force label
-                e["label"] = "ACCOUNT_ID"
-                e["source"] = "rule"
-                span_found = True
+        s, eidx = m.start(), m.end()
+        span = m.group(0)
+        found = False
+        for ent in new:
+            if ent["start"] == s and ent["end"] == eidx:
+                ent["label"] = "ACCOUNT_ID"
+                ent["source"] = "rule"
+                found = True
                 break
-        if not span_found:
-            new_entities.append(
-                {
-                    "text": span_text,
-                    "label": "ACCOUNT_ID",
-                    "start": start,
-                    "end": end,
-                    "source": "rule",
-                }
-            )
-
-    # 3) ISSUE_TYPE based on common phrases (EN + HI)
+        if not found:
+            new.append({"text":span,"label":"ACCOUNT_ID","start":s,"end":eidx,"source":"rule"})
+    # issue phrases (english + some hindi)
     issue_keywords = [
-        "payment failure",
-        "payment failed",
-        "failed payment",
-        "payment error",
-        "payment did not go through",
-        "double payment",
-        "wrong deduction",
-        "refund",
-        "login issue",
-        "password reset",
-        "account blocked",
-        "card blocked",
-        "transaction failed",
-        "balance mismatch",
-        "भुगतान में समस्या",
-        "पैसा दो बार कट गया",
-        "रिफंड चाहिए",
+        "payment failure","payment failed","failed payment","payment error","double payment",
+        "refund","transaction failed","wrong deduction","charged twice","money deducted",
+        "भुगतान में समस्या","पैसा दो बार कट गया","रिफंड चाहिए","payment 2 बार"
     ]
-
     lowered = text.lower()
     for kw in issue_keywords:
         idx = lowered.find(kw)
         while idx != -1:
-            start, end = idx, idx + len(kw)
-            new_entities.append(
-                {
-                    "text": text[start:end],
-                    "label": "ISSUE_TYPE",
-                    "start": start,
-                    "end": end,
-                    "source": "rule",
-                }
-            )
-            idx = lowered.find(kw, end)
+            s = idx
+            eidx = idx + len(kw)
+            new.append({"text":text[s:eidx],"label":"ISSUE_TYPE","start":s,"end":eidx,"source":"rule"})
+            idx = lowered.find(kw, eidx)
+    # dedupe closely overlapping entities (keep rule-labeled ones)
+    def overlap(a,b):
+        return not (a["end"] <= b["start"] or b["end"] <= a["start"])
+    compressed = []
+    for ent in sorted(new, key=lambda x:(x["start"], - (x["end"]-x["start"]))):
+        keep = True
+        for existing in compressed:
+            if overlap(ent, existing) and ent["label"] == existing["label"]:
+                # prefer rule or longer
+                if existing.get("source") == "rule":
+                    keep = False
+                    break
+                if ent.get("source") == "rule" or (ent["end"]-ent["start"]) > (existing["end"]-existing["start"]):
+                    # replace
+                    compressed.remove(existing)
+                    break
+        if keep:
+            compressed.append(ent)
+    return compressed
 
-    return new_entities
+# Hindi-specific postprocessing to remove spacy noise on Devanagari-only spans
+def is_hindi_text(text: str) -> bool:
+    return bool(re.search(r"[\u0900-\u097F]", text))
 
+def _postprocess_ner_for_hindi(text: str, entities: List[Dict]) -> List[Dict]:
+    if not is_hindi_text(text):
+        return entities
+    cleaned = []
+    for e in entities:
+        span = e.get("text","")
+        label = e.get("label","")
+        src = e.get("source","")
+        # drop SpaCy-labeled PRODUCT/ORG/NORP if purely Hindi and no digits
+        if src == "spacy" and label in {"PRODUCT","ORG","NORP","CARDINAL"}:
+            if is_hindi_text(span) and not re.search(r"\d", span):
+                continue
+        cleaned.append(e)
+    return cleaned
 
 def _is_bad_date_entity(text: str) -> bool:
     t = text.strip().lower()
@@ -709,168 +495,80 @@ def _is_bad_date_entity(text: str) -> bool:
         return True
     return False
 
-
-def _postprocess_ner_for_hindi(text: str, entities: List[Dict]) -> List[Dict]:
-    """
-    Clean up SpaCy noise on pure Hindi spans:
-    - Drop PRODUCT / ORG / NORP / CARDINAL when text is Hindi-only,
-      except when CARDINAL contains digits (we keep numbers).
-    """
-    if not is_hindi_text(text):
-        return entities
-
-    cleaned: List[Dict] = []
-    for e in entities:
-        span = e.get("text", "")
-        label = e.get("label", "")
-        source = e.get("source", "")
-
-        if source == "spacy" and label in {"PRODUCT", "ORG", "NORP", "CARDINAL"}:
-            # If it's a Hindi-only span with no digits, drop it
-            if is_hindi_text(span) and not re.search(r"\d", span):
-                continue
-
-        cleaned.append(e)
-
-    return cleaned
-
-
 def analyze_text_ner(text: str) -> List[Dict]:
     try:
         spacy_ents = run_spacy_ner(text)
     except Exception as e:
-        logger.warning("❌ SpaCy NER failed: %s", e)
+        logger.warning("SpaCy NER failed: %s", e)
         spacy_ents = []
-
-    bert_ents = run_bert_ner(text)
+    bert_ents = run_bert_ner(text) if TRANSFORMERS_AVAILABLE else []
     merged = merge_entities(spacy_ents, bert_ents)
-
-    filtered: List[Dict] = []
+    filtered = []
     for e in merged:
-        if e["label"] == "DATE" and _is_bad_date_entity(e["text"]):
+        if e.get("label") == "DATE" and _is_bad_date_entity(e.get("text","")):
             continue
         filtered.append(e)
-
     final = add_rule_based_entities(text, filtered)
-
-    clean_ents: List[Dict] = []
+    clean = []
     for e in final:
-        if e["label"] == "DATE" and _is_bad_date_entity(e["text"]):
+        if e.get("label") == "DATE" and _is_bad_date_entity(e.get("text","")):
             continue
-        if e["label"] == "CARDINAL" and _normalize_word_token(e["text"]) in NUMBER_WORDS_EN:
+        # avoid small spelled-out numbers being mislabeled
+        if e.get("label") == "CARDINAL" and _normalize_word_token(e.get("text","")) in NUMBER_WORDS_EN:
             continue
-        clean_ents.append(e)
+        clean.append(e)
+    clean = _postprocess_ner_for_hindi(text, clean)
+    # sort by start position
+    clean = sorted(clean, key=lambda x: x.get("start",0))
+    return clean
 
-    # Hindi-specific cleanup (drop noisy SpaCy entities on Hindi spans)
-    clean_ents = _postprocess_ner_for_hindi(text, clean_ents)
-
-    return clean_ents
-
-
-###############################################################
-# RELATIONSHIP EXTRACTION
-###############################################################
-
+# -------------------------
+# Relationships
+# -------------------------
 def extract_relationships(text: str, ents: List[Dict]) -> List[Dict]:
-    relationships: List[Dict] = []
-    subject = "Customer"
-
-    issues = [e for e in ents if e["label"] == "ISSUE_TYPE"]
-    accounts = [e for e in ents if e["label"] == "ACCOUNT_ID"]
-    dates = [e for e in ents if e["label"] in ("DATE", "TIME")]
-
+    relationships = []
+    subj = "Customer"
+    issues = [e for e in ents if e.get("label") == "ISSUE_TYPE"]
+    accounts = [e for e in ents if e.get("label") == "ACCOUNT_ID"]
+    dates = [e for e in ents if e.get("label") in ("DATE","TIME")]
     for issue in issues:
-        relationships.append(
-            {
-                "subject": subject,
-                "predicate": "reports",
-                "object": issue["text"],
-            }
-        )
-
+        relationships.append({"subject":subj,"predicate":"reports","object":issue["text"]})
     for acc in accounts:
-        relationships.append(
-            {
-                "subject": subject,
-                "predicate": "has_account",
-                "object": acc["text"],
-            }
-        )
-
+        relationships.append({"subject":subj,"predicate":"has_account","object":acc["text"]})
     if dates:
-        relationships.append(
-            {
-                "subject": subject,
-                "predicate": "called_on",
-                "object": dates[0]["text"],
-            }
-        )
-
+        relationships.append({"subject":subj,"predicate":"called_on","object":dates[0]["text"]})
     return relationships
 
-
-###############################################################
-# MULTI-LANGUAGE DETECTION (TEXT)
-###############################################################
-
+# -------------------------
+# Language detection
+# -------------------------
 def detect_language_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    if detect is None:
+        # fall back to Devanagari check
+        return "hi" if is_hindi_text(text) else "en"
     try:
-        cleaned = text.strip()
-        if not cleaned:
-            return None
-        return detect(cleaned)
-    except LangDetectException:
-        return None
+        return detect(text)
     except Exception:
-        return None
+        return "hi" if is_hindi_text(text) else "en"
 
-
-###############################################################
-# SENTIMENT + EMOTION ANALYSIS (LEXICON-BASED, EN + HI)
-###############################################################
-
-POSITIVE_WORDS = {
-    # English
-    "good", "great", "awesome", "excellent", "happy", "satisfied",
-    "resolved", "thank", "thanks", "helpful", "love", "wonderful",
-    "nice",
-    # Hindi positive
-    "धन्यवाद", "शुक्रिया", "अच्छा", "बहुत अच्छा", "शानदार", "संतुष्ट",
-    "खुश", "मंगलमय", "शुभ", "सहायता", "मदद",
-}
-
-NEGATIVE_WORDS = {
-    # English
-    "bad", "terrible", "horrible", "angry", "upset", "sad", "unhappy",
-    "frustrated", "annoyed", "disappointed", "worst", "issue", "problem",
-    "complaint", "escalate", "escalation",
-    # Hindi negatives
-    "समस्या", "दिक्कत", "गलत", "खराब", "नाराज", "नाराज़", "गुस्सा",
-    "परेशान", "तुरंत",  # often used in tense / escalated tone
-}
-
+# -------------------------
+# Sentiment / Emotion (lexicon-ish)
+# -------------------------
+POSITIVE_WORDS = {"good","great","awesome","excellent","happy","satisfied","resolved","thank","thanks","helpful","love","wonderful","nice","धन्यवाद","शुक्रिया","अच्छा","सहायता","मदद"}
+NEGATIVE_WORDS = {"bad","terrible","horrible","angry","upset","sad","frustrated","annoyed","disappointed","issue","problem","complaint","escalate","समस्या","दिक्कत","नाराज","गुस्सा"}
 EMOTION_LEXICON = {
-    "anger": {"angry", "furious", "mad", "annoyed", "irritated",
-              "frustrated", "गुस्सा", "नाराज", "नाराज़"},
-    "sadness": {"sad", "upset", "unhappy", "depressed", "crying", "disappointed"},
-    "fear": {"scared", "afraid", "worried", "anxious", "fear", "nervous"},
-    "joy": {"happy", "glad", "pleased", "satisfied", "great", "awesome",
-            "good", "खुश", "शानदार"},
-    "surprise": {"surprised", "shocked", "amazed", "wow"},
+    "anger":{"angry","furious","mad","annoyed","irritated","frustrated","गुस्सा","नाराज"},
+    "joy":{"happy","glad","satisfied","good","खुश"},
 }
-
 
 def _analyze_sentiment_emotion_generic(text: str) -> SentimentEmotion:
     tokens = re.findall(r"\w+|\w+[\u0900-\u097F]+", text.lower())
     pos = sum(1 for t in tokens if t in POSITIVE_WORDS)
     neg = sum(1 for t in tokens if t in NEGATIVE_WORDS)
     total = pos + neg
-
-    if total == 0:
-        score = 0.0
-    else:
-        score = (pos - neg) / float(total)
-
+    score = 0.0 if total == 0 else (pos - neg) / float(total)
     if score >= 0.4:
         label = "very_positive"
     elif score >= 0.1:
@@ -881,608 +579,296 @@ def _analyze_sentiment_emotion_generic(text: str) -> SentimentEmotion:
         label = "negative"
     else:
         label = "neutral"
-
-    emotion_counts: Dict[str, int] = {k: 0 for k in EMOTION_LEXICON}
+    emotion_counts = {k:0 for k in EMOTION_LEXICON}
     for tok in tokens:
         for emo, words in EMOTION_LEXICON.items():
             if tok in words:
                 emotion_counts[emo] += 1
-
     total_emo = sum(emotion_counts.values())
     if total_emo == 0:
-        primary_emo = None
+        primary = None
         emo_dist = {}
     else:
-        primary_emo = max(emotion_counts.items(), key=lambda x: x[1])[0]
-        emo_dist = {k: v / total_emo for k, v in emotion_counts.items() if v > 0}
-
-    return SentimentEmotion(
-        sentiment_label=label,
-        sentiment_score=score,
-        primary_emotion=primary_emo,
-        emotions=emo_dist,
-    )
-
+        primary = max(emotion_counts.items(), key=lambda x:x[1])[0]
+        emo_dist = {k: v/total_emo for k,v in emotion_counts.items() if v>0}
+    return SentimentEmotion(sentiment_label=label, sentiment_score=score, primary_emotion=primary, emotions=emo_dist)
 
 def _analyze_hindi_sentiment(text: str) -> SentimentEmotion:
-    """
-    Hindi-specific sentiment booster:
-    - Detects gratitude / trust / hope as positive
-    - Detects strong negative complaint words
-    """
-    lower_text = text.lower()
-
-    positive_keywords = [
-        "धन्यवाद", "शुक्रिया", "आभारी", "सहायता", "मदद",
-        "विश्वास", "भरोसा", "उम्मीद", "आपकी सहायता के लिए धन्यवाद",
-        "आपकी मदद के लिए धन्यवाद", "आपका दिन शुभ हो",
-    ]
-
-    negative_keywords = [
-        "गुस्सा", "नाराज", "नाराज़", "खराब सेवा", "बहुत बुरा",
-        "धोखा", "परेशान", "शिकायत", "निराश", "बहुत खराब",
-    ]
-
-    has_pos = any(pk in text for pk in positive_keywords)
-    has_neg = any(nk in text for nk in negative_keywords)
-
+    lower = text.lower()
+    pos_keys = ["धन्यवाद","शुक्रिया","आभारी","सहायता","मदद"]
+    neg_keys = ["गुस्सा","नाराज","परेशान","शिकायत","समस्या"]
+    has_pos = any(k in lower for k in pos_keys)
+    has_neg = any(k in lower for k in neg_keys)
     if has_pos and not has_neg:
-        return SentimentEmotion(
-            sentiment_label="positive",
-            sentiment_score=0.5,
-            primary_emotion="gratitude",
-            emotions={"gratitude": 1.0},
-        )
-
+        return SentimentEmotion(sentiment_label="positive", sentiment_score=0.5, primary_emotion="gratitude", emotions={"gratitude":1.0})
     if has_neg and not has_pos:
-        return SentimentEmotion(
-            sentiment_label="negative",
-            sentiment_score=-0.5,
-            primary_emotion="anger",
-            emotions={"anger": 1.0},
-        )
-
+        return SentimentEmotion(sentiment_label="negative", sentiment_score=-0.5, primary_emotion="anger", emotions={"anger":1.0})
     if has_pos and has_neg:
-        # mixed feeling
-        return SentimentEmotion(
-            sentiment_label="neutral",
-            sentiment_score=0.0,
-            primary_emotion=None,
-            emotions={},
-        )
+        return SentimentEmotion(sentiment_label="neutral", sentiment_score=0.0, primary_emotion=None, emotions={})
+    return SentimentEmotion(sentiment_label="neutral", sentiment_score=0.0, primary_emotion=None, emotions={})
 
-    # no strong Hindi cues → neutral
-    return SentimentEmotion(
-        sentiment_label="neutral",
-        sentiment_score=0.0,
-        primary_emotion=None,
-        emotions={},
-    )
-
-
-def analyze_sentiment_emotion(text: str, language: Optional[str] = None) -> SentimentEmotion:
-    """
-    Final sentiment router:
-    - English / non-Hindi → generic lexicon model
-    - Hindi / Hinglish (contains Devanagari or lang=hi) → combine generic + Hindi booster
-    """
+def analyze_sentiment_emotion(text: str, language: Optional[str]=None) -> SentimentEmotion:
     generic = _analyze_sentiment_emotion_generic(text)
-
     if language == "hi" or is_hindi_text(text):
         hi = _analyze_hindi_sentiment(text)
-
-        # If Hindi booster gives a non-neutral signal, prefer it
         if hi.sentiment_label != "neutral" or hi.sentiment_score != 0.0:
-            # merge in generic emotions if Hindi has none
             if not hi.emotions and generic.emotions:
                 hi.emotions = generic.emotions
             if hi.primary_emotion is None:
                 hi.primary_emotion = generic.primary_emotion
             return hi
-
     return generic
 
-
-###############################################################
-# INTENT DETECTION (RULE-BASED AI)
-###############################################################
-
+# -------------------------
+# Intent detection (rule-based)
+# -------------------------
 INTENT_KEYWORDS = {
-    "payment_issue": [
-        "payment failure", "payment failed", "failed payment",
-        "payment error", "payment did not go through", "double payment",
-        "wrong deduction", "refund", "charged twice", "money deducted",
-        "भुगतान में समस्या", "पैसा दो बार कट गया", "रिफंड चाहिए",
-        "payment दो बार कट", "payment 2 बार कट",
-    ],
-    "login_issue": [
-        "login issue", "password reset", "forgot password",
-        "cannot login", "unable to login", "account blocked", "card blocked",
-    ],
-    "balance_inquiry": [
-        "balance", "available balance", "account balance", "remaining balance",
-        "बैलेंस", "खाते में कितना है",
-    ],
-    "card_lost": [
-        "lost card", "stolen card", "block my card", "card stolen",
-    ],
-    "general_complaint": [
-        "complaint", "not happy", "bad service", "very bad", "worst service",
-        "raise a complaint", "escalate", "escalation", "खराब सेवा",
-    ],
-    "information_query": [
-        "want to know", "need information", "details about", "how to",
-        "explain", "clarify",
-    ],
-    "greeting_smalltalk": [
-        "hello", "hi", "good morning", "good evening", "how are you",
-        "नमस्ते", "नमस्कार", "हेलो", "हैलो",
-        "ग्राहक सहायता में आपका स्वागत है",
-        "ग्राहक सेवा में आपका स्वागत है",
-    ],
+    "payment_issue":[ "payment failure","payment failed","refund","double payment","failed payment","transaction failed","payment error","पैसा","रिफंड","पैसा दो बार" ],
+    "login_issue":[ "login issue","password reset","cannot login","account blocked"],
+    "balance_inquiry":[ "balance","account balance","बैलेंस" ],
+    "card_lost":[ "lost card","stolen card","block my card" ],
+    "general_complaint":[ "complaint","not happy","bad service","escalate","शिकायत" ],
+    "greeting_smalltalk":[ "hello","hi","thank you","नमस्ते","नमस्कार" ],
 }
 
-
 def detect_intents(text: str, ents: Optional[List[Dict]] = None) -> IntentDetection:
-    if ents is None:
-        ents = []
-
+    if ents is None: ents = []
     lowered = text.lower()
-    scores: Dict[str, float] = defaultdict(float)
-
-    for intent, kws in INTENT_KEYWORDS.items():
+    scores = defaultdict(float)
+    for intent,kws in INTENT_KEYWORDS.items():
         for kw in kws:
             if kw in lowered:
                 scores[intent] += 1.0
-
     for e in ents:
         if e.get("label") == "ISSUE_TYPE":
             scores["payment_issue"] += 0.5
             scores["general_complaint"] += 0.5
         if e.get("label") == "ACCOUNT_ID":
-            scores["balance_inquiry"] += 0.3
-
+            scores["balance_inquiry"] += 0.2
     if not scores:
-        return IntentDetection(
-            primary_intent="unknown",
-            confidence=0.0,
-            intents={},
-        )
-
+        return IntentDetection(primary_intent="unknown", confidence=0.0, intents={})
     max_score = max(scores.values())
-    intents_norm = {k: v / max_score for k, v in scores.items()}
-    primary_intent = max(intents_norm.items(), key=lambda x: x[1])[0]
-    confidence = intents_norm[primary_intent]
+    norm = {k: v/max_score for k,v in scores.items()}
+    primary = max(norm.items(), key=lambda x:x[1])[0]
+    conf = norm[primary]
+    # prefer payment_issue if ISSUE_TYPE present
+    if any(e.get("label")=="ISSUE_TYPE" for e in ents) and "payment_issue" in norm:
+        primary = "payment_issue"
+        conf = norm["payment_issue"]
+    return IntentDetection(primary_intent=primary, confidence=conf, intents=norm)
 
-    # Auto-improve intent: if ISSUE_TYPE exists, favor payment_issue
-    if any(e.get("label") == "ISSUE_TYPE" for e in ents) and "payment_issue" in intents_norm:
-        primary_intent = "payment_issue"
-        confidence = intents_norm["payment_issue"]
-
-    return IntentDetection(
-        primary_intent=primary_intent,
-        confidence=confidence,
-        intents=intents_norm,
-    )
-
-
-###############################################################
-# THREAT & PROFANITY DETECTION
-###############################################################
-
-PROFANITY_WORDS = {
-    "shit", "damn", "bloody", "bastard", "idiot", "stupid",
-}
-
-THREAT_WORDS = {
-    "kill", "hurt", "attack", "lawsuit", "legal action", "court case",
-    "file a case", "police complaint", "police case",
-}
-
+# -------------------------
+# Threat & profanity detection
+# -------------------------
+PROFANITY_WORDS = {"shit","damn","bloody","bastard","idiot","stupid"}
+THREAT_WORDS = {"kill","hurt","attack","lawsuit","police complaint","file a case"}
 
 def detect_threats_profanity(text: str) -> ThreatProfanity:
     lowered = text.lower()
     tokens = set(re.findall(r"\w+|\w+[\u0900-\u097F]+", lowered))
-
-    prof_terms = sorted({w for w in tokens if w in PROFANITY_WORDS})
-    threat_terms = []
-
+    prof = sorted({w for w in tokens if w in PROFANITY_WORDS})
+    threats = []
     for phrase in THREAT_WORDS:
         if " " in phrase:
             if phrase in lowered:
-                threat_terms.append(phrase)
+                threats.append(phrase)
         else:
             if phrase in tokens:
-                threat_terms.append(phrase)
+                threats.append(phrase)
+    return ThreatProfanity(threat_detected=bool(threats), profanity_detected=bool(prof), threat_terms=threats, profanity_terms=prof)
 
-    return ThreatProfanity(
-        threat_detected=bool(threat_terms),
-        profanity_detected=bool(prof_terms),
-        threat_terms=sorted(set(threat_terms)),
-        profanity_terms=prof_terms,
-    )
-
-
-###############################################################
-# COMPLIANCE CHECKER (EN + HINDI AWARE)
-###############################################################
-
+# -------------------------
+# Compliance checker
+# -------------------------
 def check_compliance(text: str) -> ComplianceCheck:
-    """
-    Heuristic compliance check with Hindi-aware rules:
-      - Greeting
-      - Identity / verification
-      - Mandatory disclosure
-      - Proper closing
-    """
     lowered = text.lower()
+    greeting_ok = any(g in lowered for g in ["hello","hi","good morning","thank you","नमस्ते"])
+    id_ok = bool(re.search(r"(account number|customer id|registered mobile|date of birth|अकाउंट नंबर|account no|acc no)", lowered))
+    disclosure_ok = any(d in lowered for d in ["this call may be recorded","recorded for quality","कॉल" ]) or ("कॉल" in text and "रिकॉर्ड" in text)
+    closing_ok = bool(re.search(r"(thank you for calling|have a nice day|धन्यवाद|thank you)", lowered))
+    warnings = []
+    passed = 0
+    total = 4
+    if greeting_ok: passed += 1
+    else: warnings.append("Missing proper greeting.")
+    if id_ok: passed += 1
+    else: warnings.append("Customer identity not clearly verified.")
+    if disclosure_ok: passed += 1
+    else: warnings.append("Mandatory disclosure about recording/terms is missing.")
+    if closing_ok: passed += 1
+    else: warnings.append("No proper closing phrase / thanks.")
+    score = passed/float(total)
+    return ComplianceCheck(overall_score=score, passed=score>=0.75, warnings=warnings)
 
-    # 1) Greeting
-    greeting_ok = False
-    greeting_phrases_en = [
-        "hello", "hi", "good morning", "good afternoon", "good evening",
-        "welcome", "thank you for calling",
-    ]
-    greeting_phrases_hi = [
-        "नमस्ते",
-        "नमस्कार",
-        "हेलो",
-        "हैलो",
-        "ग्राहक सहायता में आपका स्वागत है",
-        "ग्राहक सेवा में आपका स्वागत है",
-    ]
-
-    for g in greeting_phrases_en:
-        if g in lowered:
-            greeting_ok = True
-            break
-    if not greeting_ok:
-        for g in greeting_phrases_hi:
-            if g in text:
-                greeting_ok = True
-                break
-
-    # 2) Identity verification
-    id_ok = bool(
-        re.search(
-            r"(account number|customer id|verify your identity|registered mobile|date of birth|अकाउंट नंबर)",
-            lowered,
-        )
-    )
-
-    # 3) Mandatory disclosure (EN + HI)
-    disclosure_ok = False
-    disclosure_phrases_en = [
-        "this call may be recorded",
-        "recorded for quality",
-        "monitored or recorded",
-        "terms and conditions apply",
-    ]
-    disclosure_phrases_hi = [
-        "यह कॉल गुणवत्ता और प्रशिक्षण उद्देश्यों के लिए रिकॉर्ड की जा सकती है",
-        "यह कॉल रिकॉर्ड की जा सकती है",
-        "यह कॉल रिकॉर्ड की जाएगी",
-        "गुणवत्ता और प्रशिक्षण उद्देश्यों के लिए रिकॉर्ड",
-    ]
-
-    for d in disclosure_phrases_en:
-        if d in lowered:
-            disclosure_ok = True
-            break
-    if not disclosure_ok:
-        for d in disclosure_phrases_hi:
-            if d in text:
-                disclosure_ok = True
-                break
-
-    if not disclosure_ok and ("कॉल" in text and "रिकॉर्ड" in text):
-        disclosure_ok = True
-
-    # 4) Proper closing
-    closing_ok = bool(
-        re.search(
-            r"(thank you for calling|have a nice day|have a great day|is there anything else i can help|धन्यवाद)",
-            lowered,
-        )
-    )
-
-    passed_checks = 0
-    total_checks = 4
-    warnings: List[str] = []
-
-    if greeting_ok:
-        passed_checks += 1
-    else:
-        warnings.append("Missing proper greeting.")
-
-    if id_ok:
-        passed_checks += 1
-    else:
-        warnings.append("Customer identity not clearly verified.")
-
-    if disclosure_ok:
-        passed_checks += 1
-    else:
-        warnings.append("Mandatory disclosure about recording/terms is missing.")
-
-    if closing_ok:
-        passed_checks += 1
-    else:
-        warnings.append("No proper closing phrase / thanks.")
-
-    score = passed_checks / float(total_checks)
-    passed = score >= 0.75
-
-    return ComplianceCheck(
-        overall_score=score,
-        passed=passed,
-        warnings=warnings,
-    )
-
-
-###############################################################
-# AUTO CALL SUMMARY GENERATION
-###############################################################
-
-def generate_call_summary(
-    text: str,
-    ents: List[Dict],
-    intents: IntentDetection,
-    sentiment: SentimentEmotion,
-    language: Optional[str],
-) -> str:
+# -------------------------
+# Summary / agent assist / scoring
+# -------------------------
+def generate_call_summary(text: str, ents: List[Dict], intents: IntentDetection, sentiment: SentimentEmotion, language: Optional[str]) -> str:
     sentences = [s.strip() for s in re.split(r"[.!?]", text) if s.strip()]
-    short_sentences = sentences[:3]
-
-    issue_types = [e["text"] for e in ents if e.get("label") == "ISSUE_TYPE"]
-    accounts = [e["text"] for e in ents if e.get("label") == "ACCOUNT_ID"]
-
+    short = sentences[:3]
+    issue_types = [e["text"] for e in ents if e.get("label")=="ISSUE_TYPE"]
+    accounts = [e["text"] for e in ents if e.get("label")=="ACCOUNT_ID"]
     parts = []
-
-    if language:
-        parts.append(f"Language detected: {language}.")
-    if intents.primary_intent != "unknown":
-        parts.append(f"Primary intent: {intents.primary_intent.replace('_', ' ')}.")
+    if language: parts.append(f"Language detected: {language}.")
+    if intents.primary_intent != "unknown": parts.append(f"Primary intent: {intents.primary_intent.replace('_',' ')}.")
     parts.append(f"Sentiment: {sentiment.sentiment_label} (score={sentiment.sentiment_score:.2f}).")
-
-    if issue_types:
-        parts.append(f"Issue types mentioned: {', '.join(set(issue_types))}.")
-    if accounts:
-        parts.append(f"Account references: {', '.join(set(accounts))}.")
-
-    if short_sentences:
-        parts.append("Call context: " + " ".join(short_sentences))
-
+    if issue_types: parts.append(f"Issue types: {', '.join(set(issue_types))}.")
+    if accounts: parts.append(f"Account refs: {', '.join(set(accounts))}.")
+    if short: parts.append("Call context: " + " ".join(short))
     return " ".join(parts)
 
-
-###############################################################
-# REINFORCEMENT LEARNING STYLE ADAPTIVE CALL FLOWS
-###############################################################
-
 class FlowPolicy:
-    def __init__(self, epsilon: float = 0.1):
+    def __init__(self, epsilon=0.15):
         self.epsilon = epsilon
-        self.stats: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
-            lambda: defaultdict(lambda: {"success": 0.0, "count": 0.0})
-        )
-
-    def _candidate_actions(self, intent: str) -> List[str]:
-        if intent == "payment_issue":
-            return [
-                "Ask for last 4 digits of account/card",
-                "Verify recent transaction details",
-                "Offer to check payment gateway logs",
-            ]
-        if intent == "login_issue":
-            return [
-                "Guide password reset flow",
-                "Verify registered email or mobile",
-            ]
-        if intent == "balance_inquiry":
-            return [
-                "Authenticate customer and read current balance",
-                "Offer SMS of current balance",
-            ]
-        if intent == "card_lost":
-            return [
-                "Authenticate and block card immediately",
-                "Offer to reissue card and provide timeline",
-            ]
-        if intent == "general_complaint":
-            return [
-                "Acknowledge issue and empathize",
-                "Offer escalation to supervisor",
-            ]
-        if intent == "information_query":
-            return [
-                "Provide requested information clearly",
-                "Offer to send summary via SMS/email",
-            ]
-        return [
-            "Ask clarifying question",
-            "Transfer to human agent",
-        ]
-
-    def choose_action(self, intent: str) -> str:
+        self.stats = defaultdict(lambda: defaultdict(lambda: {"success":0.0,"count":0.0}))
+    def _candidate_actions(self, intent):
+        if intent=="payment_issue":
+            return ["Ask for last 4 digits of account/card","Verify recent transaction details","Offer to check payment gateway logs"]
+        if intent=="login_issue":
+            return ["Guide password reset flow","Verify registered email or mobile"]
+        if intent=="balance_inquiry":
+            return ["Authenticate and read current balance","Offer SMS of current balance"]
+        if intent=="card_lost":
+            return ["Authenticate and block card immediately","Offer to reissue card"]
+        if intent=="general_complaint":
+            return ["Acknowledge and empathize","Offer escalation to supervisor"]
+        return ["Ask clarifying question","Transfer to human agent"]
+    def choose_action(self, intent):
         actions = self._candidate_actions(intent)
-        if not actions:
-            return "Ask clarifying question"
-
         state = intent or "unknown"
-        for a in actions:
-            _ = self.stats[state][a]
-
+        for a in actions: _=self.stats[state][a]
         if random.random() < self.epsilon:
             return random.choice(actions)
-
-        best_action = None
+        best = None
         best_score = -1e9
         for a in actions:
-            data = self.stats[state][a]
-            count = data["count"]
-            success = data["success"]
-            avg_reward = success / count if count > 0 else 0.0
-            if avg_reward > best_score:
-                best_score = avg_reward
-                best_action = a
-
-        return best_action or random.choice(actions)
-
-    def update(self, intent: str, action: str, reward: float):
+            d = self.stats[state][a]
+            avg = d["success"]/d["count"] if d["count"]>0 else 0.0
+            if avg > best_score:
+                best_score = avg
+                best = a
+        return best or random.choice(actions)
+    def update(self,intent,action,reward):
         state = intent or "unknown"
-        data = self.stats[state][action]
-        data["count"] += 1.0
-        data["success"] += float(reward)
+        d = self.stats[state][action]
+        d["count"] += 1.0
+        d["success"] += float(reward)
 
+flow_policy = FlowPolicy()
 
-flow_policy = FlowPolicy(epsilon=0.15)
-
-
-###############################################################
-# REAL-TIME AGENT ASSIST SUGGESTIONS
-###############################################################
-
-def build_agent_assist(
-    text: str,
-    ents: List[Dict],
-    intents: IntentDetection,
-    sentiment: SentimentEmotion,
-    compliance: ComplianceCheck,
-    risk: ThreatProfanity,
-) -> AgentAssist:
-    suggestions: List[str] = []
-
+def build_agent_assist(text: str, ents: List[Dict], intents: IntentDetection, sentiment: SentimentEmotion, compliance: ComplianceCheck, risk: ThreatProfanity) -> AgentAssist:
+    suggestions = []
     intent = intents.primary_intent
     if intent == "payment_issue":
-        suggestions.append("Confirm transaction date, amount, and mode of payment.")
-        suggestions.append("Check for duplicate or pending transactions.")
+        suggestions += ["Confirm transaction date, amount, and mode of payment.","Check for duplicate or pending transactions."]
     elif intent == "login_issue":
-        suggestions.append("Guide the customer through secure password reset.")
-        suggestions.append("Confirm username / registered mobile or email.")
+        suggestions += ["Guide the customer through secure password reset.","Confirm username / registered mobile or email."]
     elif intent == "balance_inquiry":
-        suggestions.append("Authenticate customer and share current balance.")
+        suggestions += ["Authenticate customer and share current balance."]
     elif intent == "card_lost":
-        suggestions.append("Immediately block the card and confirm last known transactions.")
+        suggestions += ["Immediately block the card and confirm last known transactions."]
     elif intent == "general_complaint":
-        suggestions.append("Acknowledge the issue and apologize for the inconvenience.")
-        suggestions.append("Offer escalation if the customer remains dissatisfied.")
-    elif intent == "information_query":
-        suggestions.append("Provide concise information and confirm if it answers the query.")
+        suggestions += ["Acknowledge the issue and apologize for the inconvenience.","Offer escalation if necessary."]
     else:
-        suggestions.append("Ask a clarifying question to better understand the issue.")
-
-    if sentiment.sentiment_label in {"negative", "very_negative"}:
+        suggestions += ["Ask a clarifying question to better understand the issue."]
+    if sentiment.sentiment_label in {"negative","very_negative"}:
         suggestions.append("Use empathetic phrases and reassure the customer.")
-    elif sentiment.sentiment_label in {"very_positive", "positive"}:
+    elif sentiment.sentiment_label in {"positive","very_positive"}:
         suggestions.append("Maintain positive tone and confirm if anything else is needed.")
-
     for w in compliance.warnings:
         suggestions.append(f"Compliance gap: {w}")
-
     if risk.threat_detected:
-        suggestions.append("Consider escalating due to threat / legal language.")
+        suggestions.append("Consider escalating due to threat/legal language.")
     if risk.profanity_detected:
         suggestions.append("Maintain calm tone; avoid mirroring customer's language.")
-
     call_flow_action = flow_policy.choose_action(intent)
     nba = suggestions[0] if suggestions else call_flow_action
+    return AgentAssist(suggestions=list(dict.fromkeys(suggestions)), next_best_action=nba, call_flow_action=call_flow_action)
 
-    return AgentAssist(
-        suggestions=list(dict.fromkeys(suggestions)),
-        next_best_action=nba,
-        call_flow_action=call_flow_action,
-    )
-
-
-###############################################################
-# CALL SCORE SYSTEM (IMPROVED)
-###############################################################
-
-def compute_call_score(intents: IntentDetection,
-                       sentiment: SentimentEmotion,
-                       compliance: ComplianceCheck,
-                       risk: ThreatProfanity) -> int:
-    # Intent strength (0–30)
+def compute_call_score(intents: IntentDetection, sentiment: SentimentEmotion, compliance: ComplianceCheck, risk: ThreatProfanity) -> int:
     intent_score = intents.confidence * 30
-
-    # Sentiment (−1 to +1) → 0–20
     sentiment_scaled = (1 + sentiment.sentiment_score) / 2
     sentiment_score = sentiment_scaled * 20
-
-    # Compliance (0–1 → 0–40)
     compliance_score = compliance.overall_score * 40
-
-    # Risk penalty
     penalty = 0
-    if risk.threat_detected:
-        penalty -= 40
-    if risk.profanity_detected:
-        penalty -= 25
-
-    # Soften penalty if intent is clear & some compliance exists
+    if risk.threat_detected: penalty -= 40
+    if risk.profanity_detected: penalty -= 25
     if intents.primary_intent != "unknown" and compliance.overall_score >= 0.25:
         penalty *= 0.6
-
     final_score = intent_score + sentiment_score + compliance_score + penalty
     final_score = max(0, min(100, round(final_score)))
     return final_score
 
+# -------------------------
+# Transcription wrapper (Groq Whisper)
+# -------------------------
+ALLOWED_AUDIO_EXT = {".wav",".mp3",".m4a",".flac",".ogg",".mp4",".webm",".mpeg",".mpga"}
+MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
 
-###############################################################
-# FASTAPI APP SETUP
-###############################################################
+def validate_audio(filename: str, size: int):
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext not in ALLOWED_AUDIO_EXT:
+        raise ValueError(f"Unsupported audio format: {ext}. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXT))}")
+    if size > MAX_AUDIO_MB * 1024 * 1024:
+        raise ValueError(f"File too large (> {MAX_AUDIO_MB} MB).")
 
-app = FastAPI(title="IVR NER Analyzer – All-in-One Backend", version="2.4.0")
+def transcribe_audio(file_bytes: bytes, filename: str) -> Dict[str, Optional[Union[str,float]]]:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured on server.")
+    client = get_groq_client()
+    suffix = os.path.splitext(filename)[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        with open(tmp.name, "rb") as audio:
+            resp = client.audio.transcriptions.create(model="whisper-large-v3", file=audio, response_format="verbose_json")
+    if isinstance(resp, dict):
+        text = resp.get("text","") or ""
+        language = resp.get("language")
+        duration = resp.get("duration")
+    else:
+        text = getattr(resp,"text","") or ""
+        language = getattr(resp,"language",None)
+        duration = getattr(resp,"duration",None)
+    return {"transcript": text, "language": language, "duration": duration}
 
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000",
-).split(",")
+# -------------------------
+# FastAPI app & endpoints
+# -------------------------
+app = FastAPI(title="IVR NER Analyzer (improved)", version="2.5.0")
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.on_event("startup")
+async def startup_event():
+    try_load_spacy()
+    if ENABLE_BERT:
+        try_load_bert()
+    logger.info("App startup complete. spaCy loaded=%s, BERT enabled=%s", nlp_spacy is not None, TRANSFORMERS_AVAILABLE)
 
-
-###############################################################
-# API ENDPOINTS – CORE
-###############################################################
+@app.get("/", tags=["health"])
+def root(request: Request = None):
+    return {"status":"ok","message":"IVR AI Backend running 🚀"}
 
 @app.post("/api/transcribe-audio", response_model=TranscribeAudioResponse)
 async def api_transcribe_audio(file: UploadFile = File(...)):
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured on server.")
-
     data = await file.read()
     try:
         validate_audio(file.filename, len(data))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     try:
         result = transcribe_audio(data, file.filename)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
-
     try:
-        cleaned_transcript = feature_engineer_text(result.get("transcript", "") or "")
+        cleaned_transcript = feature_engineer_text(result.get("transcript","") or "")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text cleaning failed: {e}")
-
     if not cleaned_transcript:
         raise HTTPException(status_code=500, detail="Transcription returned empty or unusable text.")
-
-    return TranscribeAudioResponse(
-        transcript=cleaned_transcript,
-        language=result.get("language"),
-        duration=result.get("duration"),
-    )
-
+    return TranscribeAudioResponse(transcript=cleaned_transcript, language=result.get("language"), duration=result.get("duration"))
 
 @app.post("/api/analyze-text", response_model=AnalyzeTextResponse)
 async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db)):
@@ -1490,18 +876,14 @@ async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db
         cleaned_text = feature_engineer_text(req.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text cleaning failed: {e}")
-
     if not cleaned_text:
         raise HTTPException(status_code=400, detail="Text is empty after cleaning.")
-
     language = detect_language_text(cleaned_text)
-
     try:
         ents = analyze_text_ner(cleaned_text)
         rels = extract_relationships(cleaned_text, ents)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"NER analysis failed: {e}")
-
     sentiment = analyze_sentiment_emotion(cleaned_text, language)
     intents = detect_intents(cleaned_text, ents)
     risk = detect_threats_profanity(cleaned_text)
@@ -1509,66 +891,39 @@ async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db
     summary = generate_call_summary(cleaned_text, ents, intents, sentiment, language)
     agent_assist = build_agent_assist(cleaned_text, ents, intents, sentiment, compliance, risk)
     score = compute_call_score(intents, sentiment, compliance, risk)
-
     try:
-        record = CallAnalysis(
-            input_type="text",
-            transcript=cleaned_text,
-            entities_json=json.dumps(ents, ensure_ascii=False),
-            relationships_json=json.dumps(rels, ensure_ascii=False),
-        )
+        record = CallAnalysis(input_type="text", transcript=cleaned_text, entities_json=json.dumps(ents, ensure_ascii=False), relationships_json=json.dumps(rels, ensure_ascii=False))
         db.add(record)
         db.commit()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
-
-    return AnalyzeTextResponse(
-        text=cleaned_text,
-        language=language,
-        entities=ents,
-        relationships=rels,
-        sentiment=sentiment,
-        intents=intents,
-        summary=summary,
-        agent_assist=agent_assist,
-        compliance=compliance,
-        risk_flags=risk,
-        call_score=score,
-    )
-
+        logger.warning("DB save failed: %s", e)
+    return AnalyzeTextResponse(text=cleaned_text, language=language, entities=ents, relationships=rels, sentiment=sentiment, intents=intents, summary=summary, agent_assist=agent_assist, compliance=compliance, risk_flags=risk, call_score=score)
 
 @app.post("/api/analyze-audio", response_model=AnalyzeAudioResponse)
 async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured on server.")
-
     data = await file.read()
     try:
         validate_audio(file.filename, len(data))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     try:
         t = transcribe_audio(data, file.filename)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
-
     try:
-        cleaned_transcript = feature_engineer_text(t.get("transcript", "") or "")
+        cleaned_transcript = feature_engineer_text(t.get("transcript","") or "")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text cleaning failed: {e}")
-
     if not cleaned_transcript:
         raise HTTPException(status_code=500, detail="Transcription returned empty or unusable text.")
-
     language = t.get("language") or detect_language_text(cleaned_transcript)
-
     try:
         ents = analyze_text_ner(cleaned_transcript)
         rels = extract_relationships(cleaned_transcript, ents)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"NER analysis failed: {e}")
-
     sentiment = analyze_sentiment_emotion(cleaned_transcript, language)
     intents = detect_intents(cleaned_transcript, ents)
     risk = detect_threats_profanity(cleaned_transcript)
@@ -1576,76 +931,29 @@ async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(
     summary = generate_call_summary(cleaned_transcript, ents, intents, sentiment, language)
     agent_assist = build_agent_assist(cleaned_transcript, ents, intents, sentiment, compliance, risk)
     score = compute_call_score(intents, sentiment, compliance, risk)
-
     try:
-        record = CallAnalysis(
-            input_type="audio",
-            transcript=cleaned_transcript,
-            entities_json=json.dumps(ents, ensure_ascii=False),
-            relationships_json=json.dumps(rels, ensure_ascii=False),
-        )
+        record = CallAnalysis(input_type="audio", transcript=cleaned_transcript, entities_json=json.dumps(ents, ensure_ascii=False), relationships_json=json.dumps(rels, ensure_ascii=False))
         db.add(record)
         db.commit()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
+        logger.warning("DB save failed: %s", e)
+    return AnalyzeAudioResponse(transcript=cleaned_transcript, language=language, duration=t.get("duration"), entities=ents, relationships=rels, sentiment=sentiment, intents=intents, summary=summary, agent_assist=agent_assist, compliance=compliance, risk_flags=risk, call_score=score)
 
-    return AnalyzeAudioResponse(
-        transcript=cleaned_transcript,
-        language=language,
-        duration=t.get("duration"),
-        entities=ents,
-        relationships=rels,
-        sentiment=sentiment,
-        intents=intents,
-        summary=summary,
-        agent_assist=agent_assist,
-        compliance=compliance,
-        risk_flags=risk,
-        call_score=score,
-    )
-
-
-@app.get("/api/history", response_model=List[HistoryItem])
+@app.get("/api/history", response_model=List[Dict])
 async def api_history(limit: int = 50, db: Session = Depends(get_db)):
     limit = max(1, min(200, limit))
-    rows = (
-        db.query(CallAnalysis)
-        .order_by(CallAnalysis.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-
-    items: List[HistoryItem] = []
+    rows = db.query(CallAnalysis).order_by(CallAnalysis.created_at.desc()).limit(limit).all()
+    out = []
     for r in rows:
         ents = json.loads(r.entities_json or "[]")
         rels = json.loads(r.relationships_json or "[]")
-        items.append(
-            HistoryItem(
-                id=r.id,
-                created_at=r.created_at,
-                input_type=r.input_type,
-                transcript=r.transcript,
-                entities=ents,
-                relationships=rels,
-            )
-        )
-    return items
-
-
-###############################################################
-# CALL ANALYTICS DASHBOARD ENDPOINT
-###############################################################
+        out.append({"id": r.id, "created_at": r.created_at.isoformat(), "input_type": r.input_type, "transcript": r.transcript, "entities": ents, "relationships": rels})
+    return out
 
 @app.get("/api/analytics-dashboard")
 async def api_analytics_dashboard(limit: int = 200, db: Session = Depends(get_db)):
     limit = max(1, min(1000, limit))
-    rows = (
-        db.query(CallAnalysis)
-        .order_by(CallAnalysis.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-
+    rows = db.query(CallAnalysis).order_by(CallAnalysis.created_at.desc()).limit(limit).all()
     total_calls = len(rows)
     by_type = Counter()
     by_language = Counter()
@@ -1654,34 +962,23 @@ async def api_analytics_dashboard(limit: int = 200, db: Session = Depends(get_db
     sentiment_scores: List[float] = []
     threat_count = 0
     profanity_count = 0
-
     for r in rows:
         by_type[r.input_type or "unknown"] += 1
         transcript = r.transcript or ""
         ents = json.loads(r.entities_json or "[]")
-
         lang = detect_language_text(transcript)
-        if lang:
-            by_language[lang] += 1
-
+        if lang: by_language[lang] += 1
         sentiment = analyze_sentiment_emotion(transcript, lang)
         sentiment_scores.append(sentiment.sentiment_score)
-
         intents = detect_intents(transcript, ents)
         by_intent[intents.primary_intent] += 1
-
         risk = detect_threats_profanity(transcript)
-        if risk.threat_detected:
-            threat_count += 1
-        if risk.profanity_detected:
-            profanity_count += 1
-
+        if risk.threat_detected: threat_count += 1
+        if risk.profanity_detected: profanity_count += 1
         for e in ents:
             if e.get("label") == "ISSUE_TYPE":
                 issue_type_counts[e["text"].lower()] += 1
-
-    avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0.0
-
+    avg_sentiment = sum(sentiment_scores)/len(sentiment_scores) if sentiment_scores else 0.0
     return {
         "total_calls": total_calls,
         "by_input_type": dict(by_type),
@@ -1693,37 +990,21 @@ async def api_analytics_dashboard(limit: int = 200, db: Session = Depends(get_db
         "issue_type_counts": dict(issue_type_counts),
     }
 
-
-###############################################################
-# RL FLOW FEEDBACK ENDPOINT
-###############################################################
-
 @app.post("/api/flow-feedback")
-async def api_flow_feedback(req: FlowFeedbackRequest):
+async def api_flow_feedback(payload: Dict):
     try:
-        intent = req.intent or "unknown"
-        flow_policy.update(intent=intent, action=req.chosen_action, reward=req.reward)
-        return {"status": "ok"}
+        intent = payload.get("intent") or "unknown"
+        action = payload["chosen_action"]
+        reward = float(payload.get("reward", 0.0))
+        flow_policy.update(intent=intent, action=action, reward=reward)
+        return {"status":"ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update flow policy: {e}")
 
-
-###############################################################
-# ROOT (Optional Health Check)
-###############################################################
-
-@app.get("/")
-@app.head("/")
-def root(request: Request = None):
-    return {"status": "ok", "message": "IVR AI Backend running 🚀"}
-
-
-###############################################################
-# ENTRYPOINT
-###############################################################
-
+# Entrypoint for local run
 if __name__ == "__main__":
     import uvicorn
-
+    # host/port can be configured with env vars
+    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host=host, port=port, reload=True)
