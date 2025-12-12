@@ -829,13 +829,20 @@ def analyze_pipeline(raw_text: str) -> Dict:
 # FastAPI app initialization
 # -------------------------
 app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
+# --------------------------------------------
+# FIX: Convert HEAD to GET to avoid 405 errors
+# --------------------------------------------
+@app.middleware("http")
+async def convert_head_to_get(request: Request, call_next):
+    if request.method == "HEAD":
+        # Treat HEAD request as GET so browsers/load balancers won't fail
+        request.scope["method"] = "GET"
+    return await call_next(request)
 
 # --------------------------------------------------------------------
 # CORS CONFIGURATION (env-driven, safe default)
 # --------------------------------------------------------------------
-# --------------------------------------------------------------------
-# CORS CONFIGURATION (env-driven, safe default)
-# --------------------------------------------------------------------
+
 def _cors_allow_origins_list(parsed: List[str]) -> List[str]:
     # If ALLOWED_ORIGINS env explicitly allows "*", return ["*"]
     if parsed == ["*"]:
@@ -876,9 +883,12 @@ async def startup_event():
         try_load_bert()
     logger.info("App startup complete. spaCy loaded=%s, BERT enabled=%s", nlp_spacy is not None, TRANSFORMERS_AVAILABLE)
 
-@app.get("/", tags=["health"])
-def root(request: Request = None):
-    return {"status":"ok","message":"IVR AI Backend running 🚀", "groq_configured": bool(GROQ_API_KEY), "spaCy_loaded": bool(nlp_spacy)}
+# --------------------------------------------
+# FIX: Add HEAD route for health checks
+# --------------------------------------------
+@app.head("/", tags=["health"])
+def head_root():
+    return {}
 
 @app.post("/api/transcribe-audio", response_model=TranscribeAudioResponse)
 async def api_transcribe_audio(file: UploadFile = File(...)):
