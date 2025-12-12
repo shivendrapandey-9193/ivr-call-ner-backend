@@ -830,20 +830,22 @@ def analyze_pipeline(raw_text: str) -> Dict:
 # -------------------------
 app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
 
-cors_origins = [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "https://ivr-call-frontend.onrender.com",
-    "https://ivr-call-frontend.vercel.app"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://ivr-call-frontend.onrender.com",
+        "https://ivr-call-frontend.vercel.app",
+        "https://ivr-ui.onrender.com"   # your UI deployed on Render
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------
 # FastAPI app endpoints
