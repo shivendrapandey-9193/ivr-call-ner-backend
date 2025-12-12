@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Union
 from collections import defaultdict, Counter
 from fastapi.responses import Response
+from fastapi.responses import JSONResponse
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -834,16 +835,28 @@ app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
 # FIX: Convert HEAD to GET to avoid 405 errors
 # --------------------------------------------
 @app.middleware("http")
-async def convert_head_to_get(request: Request, call_next):
+async def fix_head_requests(request: Request, call_next):
     if request.method == "HEAD":
         request.scope["method"] = "GET"
     return await call_next(request)
 
-# Fix OPTIONS preflight
-@app.options("/{full_path:path}")
-async def preflight_handler(full_path: str):
-    return Response(status_code=200)
+# Handle OPTIONS preflight (CORS)
+@app.options("/{rest_of_path:path}")
+async def cors_preflight(rest_of_path: str):
+    return JSONResponse(
+        content={"message": "CORS preflight OK"},
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
+# Additional explicit HEAD route for health
+@app.head("/", tags=["health"])
+def head_root():
+    return {}
 # --------------------------------------------------------------------
 # CORS CONFIGURATION (env-driven, safe default)
 # --------------------------------------------------------------------
@@ -888,13 +901,6 @@ async def startup_event():
         try_load_bert()
     logger.info("App startup complete. spaCy loaded=%s, BERT enabled=%s", nlp_spacy is not None, TRANSFORMERS_AVAILABLE)
 
-# --------------------------------------------
-# FIX: Add HEAD route for health checks
-# --------------------------------------------
-# FIX: Add HEAD route for health checks
-@app.head("/", tags=["health"])
-def head_root():
-    return {}
 
 # NEW: Add GET / route for Render, browsers, and health checks
 @app.get("/", tags=["health"])
