@@ -17,6 +17,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Union
 from collections import defaultdict, Counter
+from fastapi.responses import Response
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -835,9 +836,13 @@ app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
 @app.middleware("http")
 async def convert_head_to_get(request: Request, call_next):
     if request.method == "HEAD":
-        # Treat HEAD request as GET so browsers/load balancers won't fail
         request.scope["method"] = "GET"
     return await call_next(request)
+
+# Fix OPTIONS preflight
+@app.options("/{full_path:path}")
+async def preflight_handler(full_path: str):
+    return Response(status_code=200)
 
 # --------------------------------------------------------------------
 # CORS CONFIGURATION (env-driven, safe default)
@@ -886,9 +891,16 @@ async def startup_event():
 # --------------------------------------------
 # FIX: Add HEAD route for health checks
 # --------------------------------------------
+# FIX: Add HEAD route for health checks
 @app.head("/", tags=["health"])
 def head_root():
     return {}
+
+# NEW: Add GET / route for Render, browsers, and health checks
+@app.get("/", tags=["health"])
+def get_root():
+    return {"status": "ok", "message": "IVR NER Backend is running"}
+
 
 @app.post("/api/transcribe-audio", response_model=TranscribeAudioResponse)
 async def api_transcribe_audio(file: UploadFile = File(...)):
