@@ -830,22 +830,40 @@ def analyze_pipeline(raw_text: str) -> Dict:
 # -------------------------
 app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
 
+# --------------------------------------------------------------------
+# CORS CONFIGURATION (env-driven, safe default)
+# --------------------------------------------------------------------
+# --------------------------------------------------------------------
+# CORS CONFIGURATION (env-driven, safe default)
+# --------------------------------------------------------------------
+def _cors_allow_origins_list(parsed: List[str]) -> List[str]:
+    # If ALLOWED_ORIGINS env explicitly allows "*", return ["*"]
+    if parsed == ["*"]:
+        return ["*"]
+
+    # If no origins parsed → use these default safe origins
+    if not parsed:
+        return [
+            "https://ivr-call-frontend.onrender.com",
+            "https://ivr-ui.onrender.com",
+            "https://ivr-call-frontend.vercel.app",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+        ]
+
+    return parsed
+
+_allow_origins = _cors_allow_origins_list(ALLOWED_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://ivr-call-frontend.onrender.com",
-        "https://ivr-call-frontend.vercel.app",
-        "https://ivr-ui.onrender.com"   # your UI deployed on Render
-    ],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # -------------------------
 # FastAPI app endpoints
@@ -1043,4 +1061,6 @@ if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host=host, port=port, reload=True)
+    uvicorn.run(app, host=host, port=port, reload=True)
+
+
