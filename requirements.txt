@@ -1,27 +1,26 @@
 fastapi
-uvicorn
+uvicorn[standard]
 sqlalchemy
 python-dotenv
 requests
-pydantic
 python-multipart
-watchfiles
+pydantic
 
+# spaCy + model
 spacy
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
+# NER / Transformers
 transformers
 tokenizers
 
-numpy
-
+# PyTorch CPU wheels
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 
+# NLP utilities
 pyspellchecker
 langdetect
 
+# Groq Whisper API
 groq
-
-opencv-python
-opencv-python-headless

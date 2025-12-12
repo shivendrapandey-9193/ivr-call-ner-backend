@@ -2,10 +2,12 @@
 """
 IVR NER Analyzer - Single-file improved FastAPI backend
 - Single-file corrected & cleaned version
-- Keeps spaCy + optional BERT, Groq Whisper transcription
-- Centralized analyze pipeline for text/audio
-- Safer DB operations, fixed CORS handling
+- spaCy + optional BERT, Groq Whisper transcription (optional)
+- Central analyze pipeline for text/audio
+- Fixed CORS handling (applies before routes)
+- Safer DB ops + simple analytics/history
 """
+
 import os
 import re
 import json
@@ -22,7 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# Optional third-party imports
+# Optional third-party imports (installed at runtime if available)
 try:
     import spacy
 except Exception:
@@ -39,7 +41,7 @@ except Exception:
     detect = None
     LangDetectException = Exception
 
-# transformers optional
+# Transformers (BERT) optional
 ENABLE_BERT = os.getenv("ENABLE_BERT", "0").lower() in {"1", "true", "yes"}
 TRANSFORMERS_AVAILABLE = False
 if ENABLE_BERT:
@@ -49,35 +51,36 @@ if ENABLE_BERT:
     except Exception:
         TRANSFORMERS_AVAILABLE = False
 
-# Groq optional
+# Groq Whisper optional
 try:
     from groq import Groq
 except Exception:
     Groq = None
 
+# dotenv
+from dotenv import load_dotenv
+load_dotenv()
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ivr-ner")
 
-# Load .env if present
-from dotenv import load_dotenv
-load_dotenv()
-
+# Env / config
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ivr_ner.db").strip()
-ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").strip()
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "*").strip()  # default allow all for simplicity
+MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
 
-# Parse ALLOWED_ORIGINS carefully. If string is "*" explicitly, allow all origins.
 def parse_allowed_origins(env_value: str) -> List[str]:
-    env_value = (env_value or "").strip()
-    if env_value == "*" or env_value == '["*"]':
+    v = (env_value or "").strip()
+    if v == "*" or v == '["*"]':
         return ["*"]
-    parts = [p.strip() for p in env_value.split(",") if p.strip()]
+    parts = [p.strip() for p in v.split(",") if p.strip()]
     return parts or []
 
 ALLOWED_ORIGINS = parse_allowed_origins(ALLOWED_ORIGINS_ENV)
 
-# SQLAlchemy
+# SQLAlchemy setup
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
@@ -175,10 +178,11 @@ class AnalyzeAudioResponse(AnalyzeTextResponse):
     duration: Optional[float]
 
 # -------------------------
-# Load models (spaCy & optional BERT)
+# Model loading helpers
 # -------------------------
 nlp_spacy = None
 nlp_bert = None
+spell = None
 
 def try_load_spacy():
     global nlp_spacy
@@ -189,7 +193,6 @@ def try_load_spacy():
         nlp_spacy = None
         return
     try:
-        # Expect model installed at build time (do not auto-download in runtime)
         nlp_spacy = spacy.load("en_core_web_sm")
         logger.info("Loaded spaCy model en_core_web_sm")
     except Exception as e:
@@ -212,6 +215,13 @@ def try_load_bert():
         logger.warning("Failed to init BERT pipeline: %s", e)
         nlp_bert = None
 
+if SpellChecker is not None:
+    try:
+        spell = SpellChecker()
+    except Exception:
+        spell = None
+
+# Load models at import/startup time
 try_load_spacy()
 if ENABLE_BERT:
     try_load_bert()
@@ -280,14 +290,6 @@ def spoken_numbers_to_digits(text: str) -> str:
                     lambda m: m.group(1) + NUMBER_WORDS_EN[m.group(2)], merged, flags=re.I)
     return merged
 
-# Spell checker optional
-spell = None
-if SpellChecker is not None:
-    try:
-        spell = SpellChecker()
-    except Exception:
-        spell = None
-
 FILLER_WORDS = {"uh","umm","hmm","like","basically","actually","you know","i mean","so yeah","okay so","well","right","listen"}
 IVR_BOILERPLATE = [
     "this call may be recorded for quality purposes",
@@ -312,7 +314,6 @@ def feature_engineer_text(text: str) -> str:
     temp = spoken_numbers_to_digits(temp)
     tokens = []
     for tok in temp.split():
-        # keep short tokens, numbers, currency or Devanagari tokens untouched
         if re.fullmatch(r"\d{1,12}", tok) or re.search(r"[₹$€£]|,\d{3}", tok) or len(tok) < 3 or re.search(r"[\u0900-\u097F]", tok):
             tokens.append(tok)
             continue
@@ -325,7 +326,6 @@ def feature_engineer_text(text: str) -> str:
         else:
             tokens.append(tok)
     cleaned = " ".join(tokens)
-    # sentence casing for english spans
     sentences = [s.strip() for s in re.split(r"[.!?]", cleaned) if s.strip()]
     out_sents = []
     for s in sentences:
@@ -387,13 +387,11 @@ def merge_entities(spacy_entities: List[Dict], bert_entities: List[Dict]) -> Lis
 
 def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
     new = [e.copy() for e in entities]
-    # upgrade 8-12 digit numbers to ACCOUNT_ID
     for e in new:
         if e.get("label") in {"CARDINAL", "DATE"}:
             if re.fullmatch(r"\d{8,12}", e.get("text","").strip()):
                 e["label"] = "ACCOUNT_ID"
                 e["source"] = "rule"
-    # find any standalone 8-12 digit in text
     for m in re.finditer(r"\b\d{8,12}\b", text):
         s, eidx = m.start(), m.end()
         span = m.group(0)
@@ -406,7 +404,6 @@ def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
                 break
         if not found:
             new.append({"text":span,"label":"ACCOUNT_ID","start":s,"end":eidx,"source":"rule"})
-    # issue phrases (english + some hindi)
     issue_keywords = [
         "payment failure","payment failed","failed payment","payment error","double payment",
         "refund","transaction failed","wrong deduction","charged twice","money deducted",
@@ -420,7 +417,6 @@ def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
             eidx = idx + len(kw)
             new.append({"text":text[s:eidx],"label":"ISSUE_TYPE","start":s,"end":eidx,"source":"rule"})
             idx = lowered.find(kw, eidx)
-    # dedupe overlapping (prefer rule)
     def overlap(a,b):
         return not (a["end"] <= b["start"] or b["end"] <= a["start"])
     compressed = []
@@ -428,7 +424,6 @@ def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
         keep = True
         for existing in list(compressed):
             if overlap(ent, existing) and ent["label"] == existing["label"]:
-                # prefer rule or longer span
                 if existing.get("source") == "rule":
                     keep = False
                     break
@@ -453,7 +448,6 @@ def _postprocess_ner_for_hindi(text: str, entities: List[Dict]) -> List[Dict]:
         span = e.get("text","")
         label = e.get("label","")
         src = e.get("source","")
-        # drop spacy-labeled PRODUCT/ORG/NORP for pure Devanagari spans
         if src == "spacy" and label in {"PRODUCT","ORG","NORP","CARDINAL"}:
             if is_hindi_text(span) and not re.search(r"\d", span):
                 continue
@@ -469,7 +463,6 @@ def _is_bad_date_entity(text: str) -> bool:
     return False
 
 def analyze_text_ner(text: str) -> List[Dict]:
-    # Wrapper that runs spaCy + optional BERT + rules + hindi postprocessing
     try:
         spacy_ents = run_spacy_ner(text)
     except Exception as e:
@@ -773,7 +766,6 @@ def compute_call_score(intents: IntentDetection, sentiment: SentimentEmotion, co
 # Transcription wrapper (Groq Whisper)
 # -------------------------
 ALLOWED_AUDIO_EXT = {".wav",".mp3",".m4a",".flac",".ogg",".mp4",".webm",".mpeg",".mpga"}
-MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
 
 def validate_audio(filename: str, size: int):
     ext = os.path.splitext(filename or "")[1].lower()
@@ -803,7 +795,7 @@ def transcribe_audio(file_bytes: bytes, filename: str) -> Dict[str, Optional[Uni
     return {"transcript": text, "language": language, "duration": duration}
 
 # -------------------------
-# Central analyze pipeline (used by analyze-text and analyze-audio)
+# Central analyze pipeline
 # -------------------------
 def analyze_pipeline(raw_text: str) -> Dict:
     cleaned_text = feature_engineer_text(raw_text)
@@ -834,18 +826,28 @@ def analyze_pipeline(raw_text: str) -> Dict:
     }
 
 # -------------------------
+# FastAPI app initialization
+# -------------------------
+app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
+
+cors_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://ivr-call-frontend.onrender.com",
+    "https://ivr-call-frontend.vercel.app"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
 # FastAPI app endpoints
 # -------------------------
-app = FastAPI(title="IVR NER Analyzer (improved)", version="2.6.0")
-
-# CORS middleware - use parsed ALLOWED_ORIGINS
-cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-if ALLOWED_ORIGINS == ["*"]:
-    cors_kwargs["allow_origins"] = ["*"]
-else:
-    cors_kwargs["allow_origins"] = ALLOWED_ORIGINS
-
-app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 @app.on_event("startup")
 async def startup_event():
@@ -890,7 +892,6 @@ async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db
     except Exception as e:
         logger.exception("Full analysis failed")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
-    # persist safe copy
     try:
         record = CallAnalysis(input_type="text", transcript=out["cleaned_text"], entities_json=json.dumps(out["entities"], ensure_ascii=False), relationships_json=json.dumps(out["relationships"], ensure_ascii=False))
         db.add(record)
@@ -936,7 +937,6 @@ async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(
     except Exception as e:
         logger.exception("Analysis failed for audio")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
-    # persist record
     try:
         record = CallAnalysis(input_type="audio", transcript=out["cleaned_text"], entities_json=json.dumps(out["entities"], ensure_ascii=False), relationships_json=json.dumps(out["relationships"], ensure_ascii=False))
         db.add(record)
