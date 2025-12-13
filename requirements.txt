@@ -1,26 +1,29 @@
+# Core backend
 fastapi
 uvicorn[standard]
 sqlalchemy
 python-dotenv
-requests
 python-multipart
 pydantic
 
-# spaCy + model
+# spaCy + English model
 spacy
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
-
-# NER / Transformers
-transformers
-tokenizers
-
-# PyTorch CPU wheels
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
 
 # NLP utilities
 pyspellchecker
 langdetect
+
+# Transformers / BERT (optional, CPU)
+transformers
+
+# PyTorch CPU only
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Rate limiting
+fastapi-limiter
+redis
 
 # Groq Whisper API
 groq
