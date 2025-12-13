@@ -6,6 +6,7 @@ IVR NER Analyzer - Single-file improved FastAPI backend
 - Central analyze pipeline for text/audio
 - Fixed CORS handling (applies before routes)
 - Safer DB ops + simple analytics/history
+- Fixed: DATE false-positives, Hindi spaCy false-positives, BERT "O" filtering
 """
 
 import os
@@ -15,15 +16,16 @@ import tempfile
 import random
 import logging
 from datetime import datetime
+dt = datetime
 from typing import List, Optional, Dict, Union
 from collections import defaultdict, Counter
 from fastapi.responses import Response
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # Optional third-party imports (installed at runtime if available)
@@ -70,19 +72,9 @@ logger = logging.getLogger("ivr-ner")
 # Env / config
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ivr_ner.db").strip()
-ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "*").strip()  # default allow all for simplicity
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
 
-def parse_allowed_origins(env_value: str) -> List[str]:
-    v = (env_value or "").strip()
-    if v == "*" or v == '["*"]':
-        return ["*"]
-    parts = [p.strip() for p in v.split(",") if p.strip()]
-    return parts or []
-
-ALLOWED_ORIGINS = parse_allowed_origins(ALLOWED_ORIGINS_ENV)
-
-# SQLAlchemy setup
+# SQLAlchemy setup (sync only)
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
@@ -100,6 +92,14 @@ class CallAnalysis(Base):
     entities_json = Column(Text)
     relationships_json = Column(Text)
 
+class PolicyStat(Base):
+    __tablename__ = "policy_stats"
+    id = Column(Integer, primary_key=True, index=True)
+    state = Column(String(50))
+    action = Column(String(200))
+    success = Column(Float, default=0.0)
+    count = Column(Integer, default=0)
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -112,6 +112,24 @@ def get_db():
         except Exception:
             pass
 
+def load_policy_stats(db: Session):
+    stats = defaultdict(lambda: defaultdict(lambda: {"success":0.0,"count":0.0}))
+    for row in db.query(PolicyStat).all():
+        stats[row.state][row.action] = {"success": row.success, "count": row.count}
+    return stats
+
+def save_policy_stats(db: Session, stats: defaultdict):
+    for state, actions in stats.items():
+        for action, data in actions.items():
+            existing = db.query(PolicyStat).filter_by(state=state, action=action).first()
+            if existing:
+                existing.success = data["success"]
+                existing.count = data["count"]
+            else:
+                new = PolicyStat(state=state, action=action, success=data["success"], count=data["count"])
+                db.add(new)
+    db.commit()
+
 # -------------------------
 # Pydantic schemas
 # -------------------------
@@ -121,11 +139,19 @@ class Entity(BaseModel):
     start: int
     end: int
     source: str  # spacy | bert | merged | rule
+    confidence: float = 0.85
 
 class Relationship(BaseModel):
     subject: str
     predicate: str
     object: str
+
+class TimelineEvent(BaseModel):
+    event: str
+    timestamp: str
+    confidence: float
+    parsed_time: Optional[datetime] = None
+    start: int = 0  # Position in text for fallback sorting
 
 class TranscribeAudioResponse(BaseModel):
     transcript: str
@@ -167,6 +193,7 @@ class AnalyzeTextResponse(BaseModel):
     language: Optional[str]
     entities: List[Entity]
     relationships: List[Relationship]
+    timeline: List[TimelineEvent] = []
     sentiment: SentimentEmotion
     intents: IntentDetection
     summary: str
@@ -340,12 +367,14 @@ def feature_engineer_text(text: str) -> str:
 # -------------------------
 # NER helpers (spaCy + optional BERT + rule-based)
 # -------------------------
+SOURCE_PRIORITY = {"rule": 3, "bert": 2, "spacy": 1, "merged": 1.5}
+
 def run_spacy_ner(text: str) -> List[Dict]:
     if nlp_spacy is None:
         return []
     try:
         doc = nlp_spacy(text)
-        return [{"text": ent.text, "label": ent.label_, "start": ent.start_char, "end": ent.end_char, "source": "spacy"} for ent in doc.ents]
+        return [{"text": ent.text, "label": ent.label_, "start": ent.start_char, "end": ent.end_char, "source": "spacy", "confidence": 0.85} for ent in doc.ents]  # Heuristic confidence
     except Exception as e:
         logger.warning("SpaCy NER runtime failed: %s", e)
         return []
@@ -361,12 +390,16 @@ def run_bert_ner(text: str) -> List[Dict]:
         results = nlp_bert(text)
         ents = []
         for r in results:
+            # Skip "O" (Outside/No entity) tags – optional but recommended
+            if r.get("entity_group") == "O":
+                continue
             ents.append({
                 "text": r.get("word",""),
                 "label": _normalize_bert_label(r.get("entity_group","")),
                 "start": int(r.get("start",0)),
                 "end": int(r.get("end",0)),
-                "source": "bert"
+                "source": "bert",
+                "confidence": r.get("score", 0.85)
             })
         return ents
     except Exception as e:
@@ -375,69 +408,92 @@ def run_bert_ner(text: str) -> List[Dict]:
 
 def merge_entities(spacy_entities: List[Dict], bert_entities: List[Dict]) -> List[Dict]:
     merged = {}
-    for e in spacy_entities + bert_entities:
-        key = (e.get("start",0), e.get("end",0), e.get("label",""))
-        if key in merged:
-            existing = merged[key]
-            if len(e.get("text","")) > len(existing.get("text","")):
-                merged[key] = e
-            else:
-                existing["source"] = "merged"
-        else:
+    all_ents = spacy_entities + bert_entities
+    for e in all_ents:
+        key = (e.get("start",0), e.get("end",0))
+        if key not in merged:
             merged[key] = e.copy()
+        else:
+            existing = merged[key]
+            existing_prio = SOURCE_PRIORITY.get(existing.get("source", "spacy"), 1)
+            new_prio = SOURCE_PRIORITY.get(e.get("source", "spacy"), 1)
+            if new_prio > existing_prio:
+                merged[key] = e.copy()
+            else:
+                # Average confidence if same priority
+                avg_conf = (existing.get("confidence", 0.85) + e.get("confidence", 0.85)) / 2
+                existing["confidence"] = avg_conf
+                existing["source"] = "merged"
     return list(merged.values())
+
+def overlaps(a: Dict, b: Dict) -> bool:
+    return not (a["end"] <= b["start"] or b["end"] <= a["start"])
 
 def add_rule_based_entities(text: str, entities: List[Dict]) -> List[Dict]:
     new = [e.copy() for e in entities]
-    for e in new:
-        if e.get("label") in {"CARDINAL", "DATE"}:
-            if re.fullmatch(r"\d{8,12}", e.get("text","").strip()):
-                e["label"] = "ACCOUNT_ID"
-                e["source"] = "rule"
-    for m in re.finditer(r"\b\d{8,12}\b", text):
-        s, eidx = m.start(), m.end()
-        span = m.group(0)
-        found = False
-        for ent in new:
-            if ent.get("start") == s and ent.get("end") == eidx:
-                ent["label"] = "ACCOUNT_ID"
-                ent["source"] = "rule"
-                found = True
-                break
-        if not found:
-            new.append({"text":span,"label":"ACCOUNT_ID","start":s,"end":eidx,"source":"rule"})
-    issue_keywords = [
-        "payment failure","payment failed","failed payment","payment error","double payment",
-        "refund","transaction failed","wrong deduction","charged twice","money deducted",
-        "भुगतान में समस्या","पैसा दो बार कट गया","रिफंड चाहिए","payment 2 बार"
+
+    RULE_PATTERNS = {
+        "ACCOUNT_ID": r"\b\d{8,14}\b",
+        "PHONE_NUMBER": r"\b[6-9]\d{9}\b",
+        "CARD_NUMBER": r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
+        "TRANSACTION_ID": r"\b(txn|utr|rrn|ref)[-_]?\w{6,}\b",
+        "IFSC_CODE": r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+        "EMAIL": r"\b[\w\.-]+@[\w\.-]+\.\w+\b",
+        "AMOUNT": r"(₹|rs\.?|inr)\s?\d+"
+    }
+
+    for label, pattern in RULE_PATTERNS.items():
+        for m in re.finditer(pattern, text, re.I):
+            new_rule = {
+                "text": m.group(),
+                "label": label,
+                "start": m.start(),
+                "end": m.end(),
+                "source": "rule",
+                "confidence": 1.0
+            }
+            # Check for overlap and replace if higher priority
+            to_remove = []
+            for i, e in enumerate(new):
+                if overlaps(new_rule, e):
+                    e_prio = SOURCE_PRIORITY.get(e.get("source", "spacy"), 1)
+                    if 3 > e_prio:  # rule > others
+                        to_remove.append(i)
+            for i in sorted(to_remove, reverse=True):
+                del new[i]
+            new.append(new_rule)
+
+    ISSUE_KEYWORDS = [
+        "payment failed","refund","charged twice","money deducted",
+        "transaction failed","wrong deduction",
+        "पैसा","रिफंड","भुगतान","कट गया"
     ]
+
     lowered = text.lower()
-    for kw in issue_keywords:
-        idx = lowered.find(kw)
-        while idx != -1:
-            s = idx
-            eidx = idx + len(kw)
-            new.append({"text":text[s:eidx],"label":"ISSUE_TYPE","start":s,"end":eidx,"source":"rule"})
-            idx = lowered.find(kw, eidx)
-    def overlap(a,b):
-        return not (a["end"] <= b["start"] or b["end"] <= a["start"])
-    compressed = []
-    for ent in sorted(new, key=lambda x:(x["start"], - (x["end"]-x["start"]))):
-        keep = True
-        for existing in list(compressed):
-            if overlap(ent, existing) and ent["label"] == existing["label"]:
-                if existing.get("source") == "rule":
-                    keep = False
-                    break
-                if ent.get("source") == "rule" or (ent["end"]-ent["start"]) > (existing["end"]-existing["start"]):
-                    try:
-                        compressed.remove(existing)
-                    except ValueError:
-                        pass
-                    break
-        if keep:
-            compressed.append(ent)
-    return compressed
+    for kw in ISSUE_KEYWORDS:
+        i = lowered.find(kw)
+        while i != -1:
+            new_rule = {
+                "text": text[i:i+len(kw)],
+                "label": "ISSUE_TYPE",
+                "start": i,
+                "end": i+len(kw),
+                "source": "rule",
+                "confidence": 0.9
+            }
+            # Check overlap and replace
+            to_remove = []
+            for j, e in enumerate(new):
+                if overlaps(new_rule, e):
+                    e_prio = SOURCE_PRIORITY.get(e.get("source", "spacy"), 1)
+                    if 3 > e_prio:
+                        to_remove.append(j)
+            for j in sorted(to_remove, reverse=True):
+                del new[j]
+            new.append(new_rule)
+            i = lowered.find(kw, i+1)
+
+    return sorted(new, key=lambda x: x["start"])
 
 def is_hindi_text(text: str) -> bool:
     return bool(re.search(r"[\u0900-\u097F]", text))
@@ -457,10 +513,14 @@ def _postprocess_ner_for_hindi(text: str, entities: List[Dict]) -> List[Dict]:
     return cleaned
 
 def _is_bad_date_entity(text: str) -> bool:
+    """Identify common false-positive DATE entities like long number strings or ID phrases."""
     t = text.strip().lower()
-    if re.fullmatch(r"\d{8,12}", t):
+    # Long digit sequences often misclassified as dates (e.g., account IDs, transaction IDs)
+    if re.fullmatch(r"\d{8,14}", t):
         return True
-    if t in {"id is", "account id", "acc id"}:
+    # Common phrases misrecognized as dates
+    bad_phrases = {"id is", "account id", "acc id", "my id", "transaction id", "ref id"}
+    if t in bad_phrases:
         return True
     return False
 
@@ -470,24 +530,90 @@ def analyze_text_ner(text: str) -> List[Dict]:
     except Exception as e:
         logger.warning("SpaCy NER crashed: %s", e)
         spacy_ents = []
+
     bert_ents = run_bert_ner(text) if TRANSFORMERS_AVAILABLE else []
+
     merged = merge_entities(spacy_ents, bert_ents)
-    filtered = []
-    for e in merged:
-        if e.get("label") == "DATE" and _is_bad_date_entity(e.get("text","")):
-            continue
-        filtered.append(e)
-    final = add_rule_based_entities(text, filtered)
-    clean = []
-    for e in final:
-        if e.get("label") == "DATE" and _is_bad_date_entity(e.get("text","")):
-            continue
-        if e.get("label") == "CARDINAL" and _normalize_word_token(e.get("text","")) in NUMBER_WORDS_EN:
-            continue
-        clean.append(e)
-    clean = _postprocess_ner_for_hindi(text, clean)
-    clean = sorted(clean, key=lambda x: x.get("start", 0))
-    return clean
+
+    # Single strong DATE false-positive filter
+    filtered = [
+        e for e in merged
+        if not (e.get("label") == "DATE" and _is_bad_date_entity(e.get("text", "")))
+    ]
+
+    # Add rule-based (highest priority)
+    with_rules = add_rule_based_entities(text, filtered)
+
+    # Final Hindi post-processing: remove obvious spaCy false positives in Hindi text
+    final = _postprocess_ner_for_hindi(text, with_rules)
+
+    # Final sort by position
+    return sorted(final, key=lambda x: x.get("start", 0))
+
+# -------------------------
+# Timeline extraction (enhanced with sequence inference and chronological sorting)
+# -------------------------
+def parse_timestamp(ts_str: str) -> Optional[datetime]:
+    """Parse timestamp string to datetime, handling common formats."""
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y",
+        "%B %d, %Y",
+        "%m/%d/%Y %H:%M",
+    ]
+    for fmt in formats:
+        try:
+            return dt.strptime(ts_str, fmt)
+        except ValueError:
+            pass
+    # Fallback for transaction IDs or partial dates
+    if re.match(r"\d{4}-\d{2}-\d{2}", ts_str):
+        return dt.strptime(ts_str[:10], "%Y-%m-%d")
+    return None
+
+def extract_timeline(ents: List[Dict], text: str) -> List[Dict]:
+    timeline = []
+
+    date_time_ents = [e for e in ents if e["label"] in ["DATE", "TIME"]]
+    for e in date_time_ents:
+        parsed = parse_timestamp(e["text"])
+        timeline.append({
+            "event": "timestamp_mentioned",
+            "timestamp": e["text"],
+            "confidence": e.get("confidence", 0.85),
+            "parsed_time": parsed,
+            "start": e.get("start", 0)
+        })
+
+    # Infer transaction events
+    txn_ents = [e for e in ents if e["label"] == "TRANSACTION_ID"]
+    for t in txn_ents:
+        parsed = parse_timestamp(t["text"]) or datetime.now()
+        timeline.append({
+            "event": "transaction_referenced",
+            "timestamp": t["text"],
+            "confidence": t.get("confidence", 0.85),
+            "parsed_time": parsed,
+            "start": t.get("start", 0)
+        })
+
+    # 🔒 SAFE SORT — FIXES datetime vs int crash
+    def sort_key(event):
+        parsed = event.get("parsed_time")
+
+        # datetime events first
+        if isinstance(parsed, datetime):
+            return (0, parsed.timestamp())
+        # fallback to text position
+        start = event.get("start")
+        if isinstance(start, int):
+            return (1, start)
+
+        # absolute fallback
+        return (2, 0)
+
+    return sorted(timeline, key=sort_key)
 
 # -------------------------
 # Relationships extraction
@@ -643,17 +769,34 @@ def detect_threats_profanity(text: str) -> ThreatProfanity:
     return ThreatProfanity(threat_detected=bool(threats), profanity_detected=bool(prof), threat_terms=threats, profanity_terms=prof)
 
 # -------------------------
-# Compliance checker
+# Compliance checker (enhanced with real IVR rules)
 # -------------------------
-def check_compliance(text: str) -> ComplianceCheck:
+def check_compliance(text: str, ents: List[Dict]) -> ComplianceCheck:
     lowered = text.lower()
     greeting_ok = any(g in lowered for g in ["hello","hi","good morning","thank you","नमस्ते"])
-    id_ok = bool(re.search(r"(account number|customer id|registered mobile|date of birth|अकाउंट नंबर|account no|acc no)", lowered))
+    id_ok = bool(re.search(r"(account number|customer id|registered mobile|date of birth|अकाउंट नंबर|account no|acc no|verify identity|security question)", lowered))
     disclosure_ok = any(d in lowered for d in ["this call may be recorded","recorded for quality","कॉल"]) or ("कॉल" in lowered and "रिकॉर्ड" in lowered)
     closing_ok = bool(re.search(r"(thank you for calling|have a nice day|धन्यवाद|thank you)", lowered))
+    
+    # Additional real IVR rules
+    pii_labels = ["PHONE_NUMBER", "CARD_NUMBER", "EMAIL"]
+    pii_detected = any(e["label"] in pii_labels for e in ents)
     warnings = []
+    
+    verification_phrases = ["two factor", "otp sent", "confirm your details"]
+    secure_verification = any(v in lowered for v in verification_phrases)
+    if pii_detected and not secure_verification:
+        warnings.append("PII shared without secure verification (e.g., OTP).")
+    
+    no_sensitive_disclosure = not any(s in lowered for s in ["full card number", "complete password", "cvv"])
+    if not no_sensitive_disclosure:
+        warnings.append("Sensitive data (CVV/password) disclosed - compliance violation.")
+    
+    if pii_detected and not id_ok:
+        warnings.append("PII shared without proper identity verification.")
+    
     passed = 0
-    total = 4
+    total = 6  # Increased for more rules
     if greeting_ok: passed += 1
     else: warnings.append("Missing proper greeting.")
     if id_ok: passed += 1
@@ -662,8 +805,13 @@ def check_compliance(text: str) -> ComplianceCheck:
     else: warnings.append("Mandatory disclosure about recording/terms is missing.")
     if closing_ok: passed += 1
     else: warnings.append("No proper closing phrase / thanks.")
-    score = passed/float(total)
-    return ComplianceCheck(overall_score=score, passed=score>=0.75, warnings=warnings)
+    if not pii_detected or id_ok: passed += 1  # PII handling
+    else: warnings.append("PII shared without proper identity verification.")
+    if no_sensitive_disclosure: passed += 1  # Sensitive data
+    else: warnings.append("Sensitive data (CVV/password) disclosed - compliance violation.")
+    
+    score = passed / float(total)
+    return ComplianceCheck(overall_score=score, passed=score >= 0.75, warnings=warnings)
 
 # -------------------------
 # Summary / agent assist / scoring
@@ -683,9 +831,10 @@ def generate_call_summary(text: str, ents: List[Dict], intents: IntentDetection,
     return " ".join(parts)
 
 class FlowPolicy:
-    def __init__(self, epsilon=0.15):
+    def __init__(self, epsilon=0.15, db_stats=None):
         self.epsilon = epsilon
-        self.stats = defaultdict(lambda: defaultdict(lambda: {"success":0.0,"count":0.0}))
+        self.stats = db_stats or defaultdict(lambda: defaultdict(lambda: {"success":0.0,"count":0.0}))
+
     def _candidate_actions(self, intent):
         if intent=="payment_issue":
             return ["Ask for last 4 digits of account/card","Verify recent transaction details","Offer to check payment gateway logs"]
@@ -698,6 +847,7 @@ class FlowPolicy:
         if intent=="general_complaint":
             return ["Acknowledge and empathize","Offer escalation to supervisor"]
         return ["Ask clarifying question","Transfer to human agent"]
+
     def choose_action(self, intent):
         actions = self._candidate_actions(intent)
         state = intent or "unknown"
@@ -713,6 +863,7 @@ class FlowPolicy:
                 best_score = avg
                 best = a
         return best or random.choice(actions)
+
     def update(self,intent,action,reward):
         state = intent or "unknown"
         d = self.stats[state][action]
@@ -796,6 +947,17 @@ def transcribe_audio(file_bytes: bytes, filename: str) -> Dict[str, Optional[Uni
         duration = getattr(resp,"duration",None)
     return {"transcript": text, "language": language, "duration": duration}
 
+async def background_save_analysis(db: Session, record: CallAnalysis):
+    try:
+        db.add(record)
+        db.commit()
+    except Exception as e:
+        logger.warning("Background DB save failed: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
 # -------------------------
 # Central analyze pipeline
 # -------------------------
@@ -806,10 +968,11 @@ def analyze_pipeline(raw_text: str) -> Dict:
     language = detect_language_text(cleaned_text)
     ents = analyze_text_ner(cleaned_text)
     rels = extract_relationships(cleaned_text, ents)
+    timeline = extract_timeline(ents, cleaned_text)
     sentiment = analyze_sentiment_emotion(cleaned_text, language)
     intents = detect_intents(cleaned_text, ents)
     risk = detect_threats_profanity(cleaned_text)
-    compliance = check_compliance(cleaned_text)
+    compliance = check_compliance(cleaned_text, ents)
     summary = generate_call_summary(cleaned_text, ents, intents, sentiment, language)
     agent_assist = build_agent_assist(cleaned_text, ents, intents, sentiment, compliance, risk)
     score = compute_call_score(intents, sentiment, compliance, risk)
@@ -818,6 +981,7 @@ def analyze_pipeline(raw_text: str) -> Dict:
         "language": language,
         "entities": ents,
         "relationships": rels,
+        "timeline": timeline,
         "sentiment": sentiment,
         "intents": intents,
         "risk": risk,
@@ -827,68 +991,23 @@ def analyze_pipeline(raw_text: str) -> Dict:
         "score": score
     }
 
-# -------------------------
-# FastAPI app initialization
-# -------------------------
-app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
-# --------------------------------------------
-# FIX: Convert HEAD to GET to avoid 405 errors
-# --------------------------------------------
-@app.middleware("http")
-async def fix_head_requests(request: Request, call_next):
-    if request.method == "HEAD":
-        request.scope["method"] = "GET"
-    return await call_next(request)
+# ======================================================================
+# FASTAPI SETUP
+# ======================================================================
 
-# Handle OPTIONS preflight (CORS)
-@app.options("/{rest_of_path:path}")
-async def cors_preflight(rest_of_path: str):
-    return JSONResponse(
-        content={"message": "CORS preflight OK"},
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
+app = FastAPI(title="IVR NER Analyzer", version="2.6.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Additional explicit HEAD route for health
 @app.head("/", tags=["health"])
 def head_root():
-    return {}
-# --------------------------------------------------------------------
-# CORS CONFIGURATION (env-driven, safe default)
-# --------------------------------------------------------------------
-
-def _cors_allow_origins_list(parsed: List[str]) -> List[str]:
-    # If ALLOWED_ORIGINS env explicitly allows "*", return ["*"]
-    if parsed == ["*"]:
-        return ["*"]
-
-    # If no origins parsed → use these default safe origins
-    if not parsed:
-        return [
-            "https://ivr-call-frontend.onrender.com",
-            "https://ivr-ui.onrender.com",
-            "https://ivr-call-frontend.vercel.app",
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "http://localhost:8080",
-            "http://127.0.0.1:8080",
-        ]
-
-    return parsed
-
-_allow_origins = _cors_allow_origins_list(ALLOWED_ORIGINS)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    return Response(status_code=200)
 
 # -------------------------
 # FastAPI app endpoints
@@ -896,11 +1015,25 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    global flow_policy
+    # Load models
     try_load_spacy()
     if ENABLE_BERT:
         try_load_bert()
-    logger.info("App startup complete. spaCy loaded=%s, BERT enabled=%s", nlp_spacy is not None, TRANSFORMERS_AVAILABLE)
 
+    # Load policy stats
+    db = SessionLocal()
+    try:
+        stats = load_policy_stats(db)
+        flow_policy = FlowPolicy(epsilon=0.15, db_stats=stats)
+    finally:
+        db.close()
+
+    logger.info(
+        "Startup complete | spaCy=%s | BERT=%s",
+        nlp_spacy is not None,
+        TRANSFORMERS_AVAILABLE
+    )
 
 # NEW: Add GET / route for Render, browsers, and health checks
 @app.get("/", tags=["health"])
@@ -932,7 +1065,7 @@ async def api_transcribe_audio(file: UploadFile = File(...)):
     return TranscribeAudioResponse(transcript=cleaned_transcript, language=result.get("language"), duration=result.get("duration"))
 
 @app.post("/api/analyze-text", response_model=AnalyzeTextResponse)
-async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db)):
+async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db), background_tasks: BackgroundTasks = BackgroundTasks()):
     try:
         out = analyze_pipeline(req.text)
     except ValueError as e:
@@ -942,19 +1075,15 @@ async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
     try:
         record = CallAnalysis(input_type="text", transcript=out["cleaned_text"], entities_json=json.dumps(out["entities"], ensure_ascii=False), relationships_json=json.dumps(out["relationships"], ensure_ascii=False))
-        db.add(record)
-        db.commit()
+        background_tasks.add_task(background_save_analysis, db, record)
     except Exception as e:
-        logger.warning("DB save failed: %s", e)
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        logger.warning("DB save prep failed: %s", e)
     return AnalyzeTextResponse(
         text=out["cleaned_text"],
         language=out["language"],
         entities=out["entities"],
         relationships=out["relationships"],
+        timeline=out["timeline"],
         sentiment=out["sentiment"],
         intents=out["intents"],
         summary=out["summary"],
@@ -965,7 +1094,7 @@ async def api_analyze_text(req: AnalyzeTextRequest, db: Session = Depends(get_db
     )
 
 @app.post("/api/analyze-audio", response_model=AnalyzeAudioResponse)
-async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(get_db), background_tasks: BackgroundTasks = BackgroundTasks()):
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured on server.")
     data = await file.read()
@@ -987,20 +1116,16 @@ async def api_analyze_audio(file: UploadFile = File(...), db: Session = Depends(
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
     try:
         record = CallAnalysis(input_type="audio", transcript=out["cleaned_text"], entities_json=json.dumps(out["entities"], ensure_ascii=False), relationships_json=json.dumps(out["relationships"], ensure_ascii=False))
-        db.add(record)
-        db.commit()
+        background_tasks.add_task(background_save_analysis, db, record)
     except Exception as e:
-        logger.warning("DB save failed: %s", e)
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        logger.warning("DB save prep failed: %s", e)
     return AnalyzeAudioResponse(
         transcript=out["cleaned_text"],
         language=out["language"],
         duration=t.get("duration"),
         entities=out["entities"],
         relationships=out["relationships"],
+        timeline=out["timeline"],
         sentiment=out["sentiment"],
         intents=out["intents"],
         summary=out["summary"],
@@ -1071,12 +1196,13 @@ async def api_analytics_dashboard(limit: int = 200, db: Session = Depends(get_db
     }
 
 @app.post("/api/flow-feedback")
-async def api_flow_feedback(payload: Dict):
+async def api_flow_feedback(payload: Dict, db: Session = Depends(get_db)):
     try:
         intent = payload.get("intent") or "unknown"
         action = payload["chosen_action"]
         reward = float(payload.get("reward", 0.0))
         flow_policy.update(intent=intent, action=action, reward=reward)
+        save_policy_stats(db, flow_policy.stats)
         return {"status":"ok"}
     except KeyError:
         raise HTTPException(status_code=400, detail="Missing required field 'chosen_action'.")
@@ -1084,11 +1210,28 @@ async def api_flow_feedback(payload: Dict):
         logger.exception("Flow feedback error")
         raise HTTPException(status_code=500, detail=f"Failed to update flow policy: {e}")
 
+# -------------------------
+# Customer clustering
+# -------------------------
+@app.get("/api/cluster-customers", response_model=Dict)
+async def api_cluster_customers(db: Session = Depends(get_db)):
+    rows = db.query(CallAnalysis).all()
+    clusters = defaultdict(list)
+    for r in rows:
+        try:
+            ents = json.loads(r.entities_json or "[]")
+        except Exception:
+            ents = []
+        phones = [e["text"] for e in ents if e["label"] == "PHONE_NUMBER"]
+        accounts = [e["text"] for e in ents if e["label"] == "ACCOUNT_ID"]
+        emails = [e["text"] for e in ents if e["label"] == "EMAIL"]
+        key = phones[0] if phones else (emails[0] if emails else (accounts[0] if accounts else "unknown"))
+        clusters[key].append({"id": r.id, "created_at": r.created_at.isoformat(), "transcript_snippet": r.transcript[:100]})
+    return {"clusters": dict(clusters)}
+
 # Entrypoint for local run
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host=host, port=port, reload=True)
-
-
