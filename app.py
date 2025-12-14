@@ -1495,18 +1495,11 @@ class IVRPipeline:
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
-app = FastAPI(
-    title="IVR NER Analyzer API V5.0",
-    description="Fixed NER accuracy + Improved STT + Enhanced sentiment analysis",
-    version="5.0.0",
-    docs_url="/docs",
-)
+app = FastAPI(title="Fixed NER accuracy + Improved STT + Enhanced sentiment analysis", version="15.0.0")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
