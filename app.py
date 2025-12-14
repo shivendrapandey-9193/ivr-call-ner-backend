@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging
-
+import uuid
 # Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
@@ -35,8 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
 # CONFIGURATION
-
+# ============================================================================
 class Config:
     """Configuration settings"""
     MAX_AUDIO_SIZE_MB = 10
@@ -67,8 +68,9 @@ class Config:
         'OTP': 25,
     }
 
+# ============================================================================
 # LAZY LOADING FUNCTIONS
-
+# ============================================================================
 class LazyLoader:
     """Lazy load heavy dependencies"""
   
@@ -126,8 +128,9 @@ class LazyLoader:
                 LazyLoader._groq_llm_client = None
         return LazyLoader._groq_llm_client
 
+# ============================================================================
 # DATABASE SETUP
-
+# ============================================================================
 Base = declarative_base()
 
 class CallAnalysis(Base):
@@ -156,6 +159,49 @@ engine = create_engine(
     Config.DATABASE_URL,
     **engine_kwargs
 )
+from sqlalchemy import text
+
+def migrate_call_analysis_table():
+    # Only for SQLite
+    if not Config.DATABASE_URL.startswith("sqlite"):
+        return
+
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("PRAGMA table_info(call_analysis)")
+        ).fetchall()
+
+        existing_columns = {row[1] for row in result}
+
+        if "sentiment" not in existing_columns:
+            conn.execute(
+                text("ALTER TABLE call_analysis ADD COLUMN sentiment VARCHAR(20)")
+            )
+
+        if "intent" not in existing_columns:
+            conn.execute(
+                text("ALTER TABLE call_analysis ADD COLUMN intent VARCHAR(50)")
+            )
+
+        if "call_score" not in existing_columns:
+            conn.execute(
+                text("ALTER TABLE call_analysis ADD COLUMN call_score INTEGER")
+            )
+
+        if "language" not in existing_columns:
+            conn.execute(
+                text("ALTER TABLE call_analysis ADD COLUMN language VARCHAR(10)")
+            )
+
+        if "processing_time_ms" not in existing_columns:
+            conn.execute(
+                text("ALTER TABLE call_analysis ADD COLUMN processing_time_ms INTEGER")
+            )
+
+        conn.commit()
+
+# 🔥 RUN MIGRATION BEFORE CREATE_ALL
+migrate_call_analysis_table()
 
 
 Base.metadata.create_all(bind=engine)
@@ -169,8 +215,9 @@ def get_db():
     finally:
         db.close()
 
+# ============================================================================
 # PYDANTIC MODELS
-
+# ============================================================================
 class Entity(BaseModel):
     text: str
     label: str
@@ -237,8 +284,9 @@ class AnalyzeTextResponse(BaseModel):
     call_score: int = Field(ge=0, le=100)
     processing_time_ms: int
 
+# ============================================================================
 # TEXT PREPROCESSOR
-
+# ============================================================================
 class TextPreprocessor:
     """Text preprocessing"""
 
@@ -270,8 +318,9 @@ class TextPreprocessor:
 
         return "en"
 
+# ============================================================================
 # FIXED NER ENGINE - ALL CRITICAL ISSUES RESOLVED
-
+# ============================================================================
 class NEREngine:
     """Fixed NER engine with all accuracy issues resolved"""
   
@@ -906,9 +955,10 @@ class NEREngine:
                     entity['confidence'] = min(0.95, entity['confidence'] + 0.1)
         
         return entities
-
+    
+# ============================================================================
 # RELATIONSHIP EXTRACTOR
-
+# ============================================================================
 class RelationshipExtractor:
     """Extract semantic relationships"""
   
@@ -982,9 +1032,9 @@ class RelationshipExtractor:
                 seen.add(key)
       
         return unique_rels
-
+# ============================================================================
 # FIXED SENTIMENT ANALYZER
-
+# ============================================================================
 class SentimentAnalyzer:
     """Sentiment analysis with Groq LLM fallback"""
   
@@ -1161,8 +1211,9 @@ class SentimentAnalyzer:
       
         return None
 
+# ============================================================================
 # SUMMARY GENERATOR
-
+# ============================================================================
 class SummaryGenerator:
     """Generate summaries using Groq LLM"""
   
@@ -1267,8 +1318,9 @@ class SummaryGenerator:
       
         return " ".join(parts)
 
+# ============================================================================
 # FIXED INTENT DETECTOR - CRITICAL ISSUE 5
-
+# ============================================================================
 class IntentDetector:
     """Fixed intent detection with entity-based boosting"""
   
@@ -1338,8 +1390,9 @@ class IntentDetector:
             intents={}
         )
 
+# ============================================================================
 # FIXED THREAT DETECTOR - CRITICAL ISSUE 4
-
+# ============================================================================
 class ThreatDetector:
     """Fixed threat detection with contextual patterns"""
   
@@ -1403,8 +1456,9 @@ class ThreatDetector:
             profanity_terms=profanity_terms
         )
 
+# ============================================================================
 # COMPLIANCE CHECKER
-
+# ============================================================================
 class ComplianceChecker:
     """Check compliance"""
   
@@ -1445,8 +1499,9 @@ class ComplianceChecker:
             note="Automated compliance check"
         )
 
+# ============================================================================
 # AGENT ASSIST GENERATOR
-
+# ============================================================================
 class AgentAssistGenerator:
     """Agent assistance"""
   
@@ -1515,8 +1570,9 @@ class AgentAssistGenerator:
             call_flow_action="Follow standard escalation protocol if needed"
         )
 
+# ============================================================================
 # CALL SCORE CALCULATOR
-
+# ============================================================================
 class CallScoreCalculator:
     """Call score calculation"""
   
@@ -1552,8 +1608,9 @@ class CallScoreCalculator:
       
         return final_score
 
+# ============================================================================
 # IMPROVED STT ALGORITHM (FINAL – SAFE & WORKING)
-
+# ============================================================================
 class AudioProcessor:
     """Audio transcription with improved STT accuracy"""
 
@@ -1610,7 +1667,9 @@ class AudioProcessor:
                     )
                 )
 
+            # -----------------------------
             # SAFE RESPONSE EXTRACTION
+            # -----------------------------
             if isinstance(response, dict):
                 transcript = response.get("text", "")
                 language = response.get("language", "en")
@@ -1707,9 +1766,9 @@ class AudioProcessor:
             "duration": None,
             "success": False,
         }
-
+# ============================================================================
 # MAIN PROCESSING PIPELINE
-
+# ============================================================================
 class IVRPipeline:
     """Main IVR processing pipeline"""
 
@@ -1788,8 +1847,10 @@ class IVRPipeline:
             "processing_time_ms": processing_time_ms,
         }
 
-# DATABASE HELPER
 
+# ============================================================================
+# DATABASE HELPER
+# ============================================================================
 class DatabaseHelper:
     """Database operations"""
   
@@ -1816,14 +1877,15 @@ class DatabaseHelper:
       
         db.add(record)
         db.commit()
-      
+        db.refresh(record)
         return record.id
 
+# ======================================================================
 # FASTAPI SETUP
+# ======================================================================
 app = FastAPI(
     title="IVR NER Analyzer API",
-    version="6.0.0",
-    description="Production-grade IVR Call Analytics with NER, Sentiment, Intent, STT"
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -1832,11 +1894,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+# ============================================================================
 # API ENDPOINTS
+# ============================================================================
 @app.get("/")
 async def root():
-    return {"status": "healthy", "version": "6.0.0"}
+    return {
+        "service": "IVR NER Analyzer API",
+        "status": "running",
+        "version": "6.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "ivr-ner-analyzer",
+        "version": "6.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 
 @app.post("/api/transcribe", response_model=TranscribeResponse)
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -1868,11 +1947,39 @@ async def transcribe_audio(file: UploadFile = File(...)):
         logger.error(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/api/analyze/text", response_model=AnalyzeTextResponse)
+@app.post("/api/v1/analyze/text")
 async def analyze_text(
     request: AnalyzeTextRequest,
     db: Session = Depends(get_db)
 ):
+    """
+    Analyze text with fixed NER accuracy
+    """
+
+    if len(request.text) > Config.MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail="Input text exceeds maximum allowed length"
+        )
+
+    try:
+        result = IVRPipeline.process_text(request.text)
+
+        DatabaseHelper.save_analysis(
+            db, "text", request.text, result
+        )
+
+        return {
+            "success": True,
+            "data": result
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
+
     """
     Analyze text with fixed NER accuracy
     """
@@ -1916,33 +2023,19 @@ async def analyze_text(
             )
             for r in result['relationships']
         ]
-      
-        return AnalyzeTextResponse(
-            text=result['text'],
-            language=result['language'],
-            entities=entities_response,
-            relationships=relationships_response,
-            sentiment=result['sentiment'],
-            intents=result['intents'],
-            summary=result['summary'],
-            agent_assist=result['agent_assist'],
-            compliance=result['compliance'],
-            risk_flags=result['risk_flags'],
-            call_score=result['call_score'],
-            processing_time_ms=result['processing_time_ms'],
-        )
-      
+        
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Analysis error: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@app.post("/api/analyze/audio", response_model=AnalyzeTextResponse)
+@app.post("/api/v1/analyze/audio")
 async def analyze_audio(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
+
     """
     Transcribe and analyze audio with improved STT
     """
