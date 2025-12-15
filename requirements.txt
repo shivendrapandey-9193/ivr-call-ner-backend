@@ -1,29 +1,33 @@
-# Core backend
+# ===============================
+# Core Backend
+# ===============================
 fastapi
 uvicorn[standard]
-sqlalchemy
 python-dotenv
 python-multipart
 pydantic
 
-# spaCy + English model
-spacy
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+# ===============================
+# Speech-to-Text (Whisper)
+# ===============================
+faster-whisper
+ctranslate2
+soundfile
+numpy
+ffmpeg-python
 
-# NLP utilities
-pyspellchecker
+# ===============================
+# NLP (Multilingual)
+# ===============================
+spacy
+stanza
 langdetect
 
-# Transformers / BERT (optional, CPU)
-transformers
+# spaCy English model
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
-# PyTorch CPU only
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-
-# Rate limiting
-fastapi-limiter
-redis
-
-# Groq Whisper API
+# ===============================
+# Groq API (Whisper + LLM)
+# ===============================
 groq
+stanza
