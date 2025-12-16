@@ -10,7 +10,6 @@ requests
 numpy
 scipy
 soundfile
-pydub
 ffmpeg-python
 
 # Whisper STT
