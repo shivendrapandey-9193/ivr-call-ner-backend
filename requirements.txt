@@ -1,33 +1,29 @@
-
 # Core API
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9
-pydantic==2.6.4
-python-dotenv==1.0.1
-requests==2.31.0
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+python-dotenv
+requests
 
 # Audio & Signal Processing
-numpy==1.26.4
-scipy==1.12.0
-soundfile==0.12.1
-pydub==0.25.1
-ffmpeg-python==0.2.0
-
-# ⚠️ IMPORTANT:
-# ffmpeg BINARY must be installed separately (see note below)
+numpy
+scipy
+soundfile
+pydub
+ffmpeg-python
 
 # Whisper STT
-torch==2.2.2
-faster-whisper==1.0.3
-ctranslate2==4.2.1
+torch
+faster-whisper
+ctranslate2
 
 # LLM (Groq)
-groq==0.9.0
+groq
 
 # NLP (OPTIONAL / FUTURE)
-spacy==3.8.2
-langdetect==1.0.9
+spacy
+langdetect
 
 # spaCy English model
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
