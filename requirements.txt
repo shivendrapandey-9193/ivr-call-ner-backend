@@ -7,7 +7,7 @@ python-multipart
 pydantic
 python-dotenv
 requests
-
+matplotlib
 # ===============================
 # Data & Utilities
 # ===============================
